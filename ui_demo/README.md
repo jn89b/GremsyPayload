@@ -36,6 +36,76 @@ cd payloadsdk_python/ui_demo
 python ui_demo.py --mb1
 ```
 
+## Remote Command Bridge (MVP)
+
+This repository now includes an MVP remote-control split for click-to-track:
+
+- UI machine: runs GTK UI and sends tracking commands over TCP.
+- Gimbal machine: runs executor service, receives commands, then executes SDK calls locally.
+- Video stream: still reaches UI machine directly via RTSP over VPN.
+
+### Scope in this MVP
+
+- Supported remotely:
+	- `PAYLOAD_TOUCH` (click pixel to track)
+	- `PAYLOAD_TRACK` (start/stop tracking)
+- Other UI commands are intentionally blocked in remote mode.
+
+### 1) Start executor on gimbal machine
+
+```bash
+cd PayloadSdk/ui_demo
+python remote_executor.py \
+	--role listen \
+	--host 0.0.0.0 \
+	--port 5000 \
+	--payload-ip 192.168.55.1
+```
+
+Optional token:
+
+```bash
+python remote_executor.py --role listen --host 0.0.0.0 --port 5000 --token my-shared-token
+```
+
+### 2) Start UI on operator machine in remote mode
+
+```bash
+cd PayloadSdk/ui_demo
+python ui_demo.py \
+	--remote-mode connect \
+	--remote-host <gimbal_machine_vpn_ip> \
+	--remote-port 5000
+```
+
+Optional token:
+
+```bash
+python ui_demo.py --remote-mode connect --remote-host <gimbal_machine_vpn_ip> --remote-port 5000 --remote-token my-shared-token
+```
+
+Then in the UI:
+
+1. Put the payload/camera RTSP-reachable IP in the IP field.
+2. Press Connect (this now connects command bridge in remote mode).
+3. Click video pixels to send track-position commands to the remote executor.
+
+### Listener/connector role flexibility
+
+Both programs support `--role connect|listen` / `--remote-mode connect|listen`.
+Use whichever direction best fits your VPN routing rules.
+
+### Reliability behavior
+
+- Per-command ACK is required.
+- Timeout and retry are enabled (default retry count: 2).
+- Duplicate message IDs are acknowledged without re-execution.
+
+### New files
+
+- `remote_bridge.py`: shared TCP protocol and ACK/retry transport.
+- `remote_executor.py`: headless command-consumer service for gimbal machine.
+
 ## Features
 
 ### Connection
@@ -141,6 +211,12 @@ The UI follows the same callback-based event-driven architecture as the C++ vers
 - Verify IP address is correct
 - Check if payload is powered on
 - Check firewall is not blocking UDP port
+
+### Remote mode cannot connect
+- Verify VPN connectivity between machines and TCP port reachability.
+- Ensure UI `--remote-host/--remote-port` matches executor endpoint.
+- Ensure tokens match on both sides when token is set.
+- In listener mode, make sure firewall allows inbound TCP on bridge port.
 
 ### Not receiving parameters
 - Check if payload supports PARAM_EXT

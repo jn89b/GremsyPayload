@@ -24,11 +24,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'libs'))
 
 from main_window import MainWindow
 from payload_settings_tab import UICommand
+from remote_bridge import BridgeConfig, TcpCommandBridge
 
 # Import payload SDK
 try:
     from payload_sdk import PayloadSdkInterface
-    from config import ConnectionConfig
+    from config import ConnectionConfig, RemoteBridgeConfig
     # Import payload definitions for param IDs
     from payload_define import (
         PAYLOAD_CAMERA_VIEW_SRC,
@@ -87,12 +88,17 @@ PARAM_TYPE_REAL32 = 9
 class PayloadUIDemo:
     """Main application class"""
 
-    def __init__(self, is_mb1=False):
+    def __init__(self, is_mb1=False, remote_mode="disabled", remote_host=None, remote_port=None, remote_token=None):
         self.sdk = None
         self.window = None
         self.is_connected = False
         self.running = True
         self.is_mb1 = is_mb1
+        self.remote_mode = remote_mode
+        self.remote_host = remote_host or RemoteBridgeConfig.HOST
+        self.remote_port = int(remote_port if remote_port is not None else RemoteBridgeConfig.PORT)
+        self.remote_token = remote_token if remote_token is not None else RemoteBridgeConfig.TOKEN
+        self.remote_bridge = None
 
         # Create main window (pass is_mb1 flag)
         self.window = MainWindow(1600, 900, is_mb1=is_mb1)
@@ -105,6 +111,9 @@ class PayloadUIDemo:
     def _on_window_destroy(self, widget):
         """Handle window close"""
         self.running = False
+        if self.remote_bridge:
+            self.remote_bridge.stop()
+            self.remote_bridge = None
         if self.sdk:
             self.sdk.sdkQuit()
         Gtk.main_quit()
@@ -118,6 +127,10 @@ class PayloadUIDemo:
 
     def _connect_payload(self, ip):
         """Connect to payload"""
+        if self.remote_mode in ("connect", "listen"):
+            self._connect_remote_bridge()
+            return
+
         print(f"Connecting to payload at {ip}...")
 
         # Update config with new IP
@@ -216,6 +229,10 @@ class PayloadUIDemo:
         """Disconnect from payload"""
         print("Disconnecting from payload...")
         self.is_connected = False
+
+        if self.remote_bridge:
+            self.remote_bridge.stop()
+            self.remote_bridge = None
 
         if self.sdk:
             self.sdk.sdkQuit()
@@ -341,6 +358,10 @@ class PayloadUIDemo:
 
     def _on_ui_command(self, command, params):
         """Handle UI commands"""
+        if self.remote_mode in ("connect", "listen"):
+            self._on_ui_command_remote(command, params)
+            return
+
         if not self.sdk or not self.is_connected:
             print(f"Not connected, ignoring command: {command}")
             return
@@ -594,6 +615,57 @@ class PayloadUIDemo:
         except Exception as e:
             print(f"Error executing command {command}: {e}")
 
+    def _connect_remote_bridge(self):
+        """Connect UI to remote command bridge and enable controls."""
+        if self.remote_bridge:
+            self.remote_bridge.stop()
+            self.remote_bridge = None
+
+        print(
+            f"Connecting remote bridge mode={self.remote_mode} endpoint={self.remote_host}:{self.remote_port}"
+        )
+
+        cfg = BridgeConfig(
+            role=self.remote_mode,
+            host=self.remote_host,
+            port=self.remote_port,
+            token=self.remote_token,
+            connect_timeout=RemoteBridgeConfig.CONNECT_TIMEOUT,
+            ack_timeout=RemoteBridgeConfig.ACK_TIMEOUT,
+            retry_count=RemoteBridgeConfig.RETRY_COUNT,
+            reconnect_interval=RemoteBridgeConfig.RECONNECT_INTERVAL,
+        )
+        self.remote_bridge = TcpCommandBridge(cfg)
+        self.remote_bridge.start()
+
+        # In listener mode we allow UI operation immediately while waiting for peer.
+        if self.remote_mode == "connect":
+            if not self.remote_bridge.wait_until_connected(RemoteBridgeConfig.CONNECT_TIMEOUT):
+                print("Remote bridge connect timeout")
+                GLib.idle_add(self._update_ui_disconnected)
+                return
+
+        self.is_connected = True
+        GLib.idle_add(self._update_ui_connected)
+        print("Remote bridge ready")
+
+    def _on_ui_command_remote(self, command, params):
+        """Send a whitelisted UI command over remote bridge."""
+        if not self.remote_bridge or not self.is_connected:
+            print(f"Remote bridge not connected, ignoring command: {command}")
+            return
+
+        # MVP whitelist: tracking mode + touch position only.
+        if command not in (UICommand.PAYLOAD_TOUCH, UICommand.PAYLOAD_TRACK):
+            print(f"Remote mode MVP blocks command: {command}")
+            return
+
+        ok, detail = self.remote_bridge.send_command(command=command, params=params or [], ack_required=True)
+        if not ok:
+            print(f"Remote command failed command={command} detail={detail}")
+        else:
+            print(f"Remote command ack command={command} detail={detail}")
+
     def run(self):
         """Run the application"""
         Gtk.main()
@@ -604,6 +676,15 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Payload SDK UI Demo - Python")
     parser.add_argument('--mb1', action='store_true', help="Enable MB1 payload mode (MB1-specific controls)")
+    parser.add_argument(
+        '--remote-mode',
+        choices=['disabled', 'connect', 'listen'],
+        default=RemoteBridgeConfig.MODE,
+        help="Remote command bridge mode; in remote mode only click-to-track MVP commands are enabled",
+    )
+    parser.add_argument('--remote-host', default=RemoteBridgeConfig.HOST, help="Remote bridge host")
+    parser.add_argument('--remote-port', type=int, default=RemoteBridgeConfig.PORT, help="Remote bridge port")
+    parser.add_argument('--remote-token', default=RemoteBridgeConfig.TOKEN, help="Optional shared token")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -615,10 +696,20 @@ def main():
             print("Warning: MB1 definitions not found, some features may not work")
     else:
         print("Mode: Standard Payload")
+    if args.remote_mode != 'disabled':
+        print(
+            f"Remote Command Mode: {args.remote_mode} {args.remote_host}:{args.remote_port} (MVP tracking only)"
+        )
     print("=" * 60)
 
     # Create and run application
-    app = PayloadUIDemo(is_mb1=args.mb1)
+    app = PayloadUIDemo(
+        is_mb1=args.mb1,
+        remote_mode=args.remote_mode,
+        remote_host=args.remote_host,
+        remote_port=args.remote_port,
+        remote_token=args.remote_token,
+    )
     app.run()
 
 

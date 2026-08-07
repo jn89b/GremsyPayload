@@ -1,0 +1,25 @@
+[project]
+name = "payloadsdk"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "jn89b", email = "jnguyenblue2804@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mavproxy>=1.8.74",
+    "numpy>=2.5.1",
+    "pygobject==3.50.0 ; python_full_version >= '3.9'",
+    "pygobject>=3.50.0 ; python_full_version < '3.9'",
+    "pymavlink>=2.4.49",
+    "pyserial>=3.5",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+payloadsdk = "payloadsdk:main"
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"

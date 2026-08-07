@@ -141,6 +141,34 @@ class CommunicationConfig:
     # Ping settings
     PING_INITIAL_SEQ = 0
 
+
+# ============================================================================
+# Remote Bridge Configuration
+# ============================================================================
+class RemoteBridgeConfig:
+    """Remote command bridge settings for multi-machine UI control."""
+
+    ENABLED = False
+
+    # Mode:
+    # - disabled: local SDK execution path (default)
+    # - connect: actively connect to remote peer
+    # - listen: bind and wait for remote peer
+    MODE = "disabled"
+
+    # Network endpoint
+    HOST = "127.0.0.1"
+    PORT = 5000
+
+    # Optional shared token used in request frames
+    TOKEN = ""
+
+    # Reliability behavior
+    CONNECT_TIMEOUT = 3.0
+    ACK_TIMEOUT = 1.5
+    RETRY_COUNT = 2
+    RECONNECT_INTERVAL = 1.0
+
 # ============================================================================
 # Parameter Configuration
 # ============================================================================
