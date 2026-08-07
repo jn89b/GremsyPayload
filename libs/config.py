@@ -28,8 +28,12 @@ class ConnectionConfig:
     CONTROL_METHOD = CONTROL_UDP
     
     # UDP Configuration
-    UDP_IP_TARGET = "192.168.55.1"      # Payload IP address
+    UDP_IP_TARGET = "100.89.182.15"      # Payload IP address
     UDP_PORT_TARGET = 14566             # Do not change
+
+    # RTSP defaults for UI streaming preview
+    RTSP_PORT_TARGET = 8554
+    RTSP_PATH_TARGET = "eo"
     
     # UART Configuration
     UART_PORT = "/dev/ttyUSB0"

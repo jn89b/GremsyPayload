@@ -570,7 +570,11 @@ class PayloadSettingsTab(Gtk.Box):
         self.url_entry = Gtk.Entry()
         self.url_entry.set_placeholder_text("rtsp://example.com:554/stream")
         # Default RTSP URL from config IP
-        default_rtsp_url = f"rtsp://{ConnectionConfig.UDP_IP_TARGET}:8554/payload"
+        default_rtsp_url = (
+            f"rtsp://{ConnectionConfig.UDP_IP_TARGET}:"
+            f"{ConnectionConfig.RTSP_PORT_TARGET}/"
+            f"{ConnectionConfig.RTSP_PATH_TARGET}"
+        )
         self.url_entry.set_text(default_rtsp_url)
         self.url_entry.connect("activate", self._on_url_entry_activate)
         url_box.pack_start(self.url_entry, True, True, 0)
@@ -1664,38 +1668,76 @@ class PayloadSettingsTab(Gtk.Box):
         if self.is_playing:
             self._stop_stream()
 
-        # Create GStreamer pipeline with xvimagesink for X11 window embedding
-        # Use ximagesink or xvimagesink instead of autovideosink for window handle support
-        pipeline_str = f"rtspsrc location={rtsp_url} latency=200 ! decodebin ! videoconvert ! xvimagesink name=vsink sync=false"
+        # Use overlay-capable sinks that render inside the GTK drawing area.
+        # Skip xvimagesink because many systems report "No Xv Port available".
+        sink_chain_candidates = [
+            "ximagesink name=vsink sync=false",
+            "glimagesink name=vsink sync=false",
+        ]
 
-        try:
-            self.pipeline = Gst.parse_launch(pipeline_str)
-            if not self.pipeline:
-                print("Failed to create pipeline")
+        for sink_chain in sink_chain_candidates:
+            pipeline_str = (
+                f"rtspsrc location={rtsp_url} latency=200 ! "
+                f"decodebin ! videoconvert ! {sink_chain}"
+            )
+
+            try:
+                self.pipeline = Gst.parse_launch(pipeline_str)
+                if not self.pipeline:
+                    print(f"Failed to create pipeline with sink: {sink_chain}")
+                    continue
+
+                # Get video sink and connect to bus for window handle and error reports.
+                bus = self.pipeline.get_bus()
+                bus.add_signal_watch()
+                bus.enable_sync_message_emission()
+                bus.connect("sync-message::element", self._on_sync_message)
+                bus.connect("message::error", self._on_gst_error)
+                bus.connect("message::warning", self._on_gst_warning)
+
+                # Bind early when possible to avoid sink-created external windows.
+                vsink = self.pipeline.get_by_name("vsink")
+                if vsink and self.video_window_handle and hasattr(vsink, "set_window_handle"):
+                    vsink.set_window_handle(self.video_window_handle)
+
+                # Start playing
+                ret = self.pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    print(f"Failed to start pipeline with sink: {sink_chain}")
+                    self._cleanup_gstreamer()
+                    continue
+
+                self.is_playing = True
+                self.play_button.set_sensitive(False)
+                self.stop_button.set_sensitive(True)
+                self.url_entry.set_sensitive(False)
+                if self.fullscreen_button:
+                    self.fullscreen_button.set_sensitive(True)
+
+                print(f"Stream started with sink: {sink_chain}")
                 return
 
-            # Get video sink and connect to bus for window handle
-            bus = self.pipeline.get_bus()
-            bus.add_signal_watch()
-            bus.enable_sync_message_emission()
-            bus.connect("sync-message::element", self._on_sync_message)
-
-            # Start playing
-            ret = self.pipeline.set_state(Gst.State.PLAYING)
-            if ret == Gst.StateChangeReturn.FAILURE:
-                print("Failed to start pipeline")
+            except Exception as e:
+                print(f"Error starting stream with sink {sink_chain}: {e}")
                 self._cleanup_gstreamer()
-                return
 
-            self.is_playing = True
-            self.play_button.set_sensitive(False)
-            self.stop_button.set_sensitive(True)
-            self.url_entry.set_sensitive(False)
-            if self.fullscreen_button:
-                self.fullscreen_button.set_sensitive(True)
+        print("Failed to start pipeline")
 
-        except Exception as e:
-            print(f"Error starting stream: {e}")
+    def _on_gst_error(self, bus, message):
+        """Print detailed GStreamer error information."""
+        err, debug_info = message.parse_error()
+        err_src = message.src.get_name() if message.src else "unknown"
+        print(f"GStreamer error from {err_src}: {err.message}")
+        if debug_info:
+            print(f"GStreamer debug: {debug_info}")
+
+    def _on_gst_warning(self, bus, message):
+        """Print GStreamer warnings for stream troubleshooting."""
+        warn, debug_info = message.parse_warning()
+        warn_src = message.src.get_name() if message.src else "unknown"
+        print(f"GStreamer warning from {warn_src}: {warn.message}")
+        if debug_info:
+            print(f"GStreamer debug: {debug_info}")
 
     def _on_sync_message(self, bus, message):
         """Handle GStreamer sync messages for video overlay"""
@@ -1749,7 +1791,9 @@ class PayloadSettingsTab(Gtk.Box):
     def update_rtsp_url_from_ip(self, ip):
         """Update RTSP URL from IP"""
         if self.url_entry:
-            self.url_entry.set_text(f"rtsp://{ip}:8554/payload")
+            self.url_entry.set_text(
+                f"rtsp://{ip}:{ConnectionConfig.RTSP_PORT_TARGET}/{ConnectionConfig.RTSP_PATH_TARGET}"
+            )
 
     def update_storage_info(self, status, total, used, available):
         """Update storage info label

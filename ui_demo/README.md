@@ -20,20 +20,50 @@ sudo apt-get install gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0
 pip install PyGObject
 ```
 
+## Quick Setup (Ubuntu 24.04)
+
+If you see `gst_parse_error: no element "rtspsrc"`, install the full GStreamer runtime stack below.
+
+1. Install system packages:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+	python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
+	gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+	gstreamer1.0-tools gstreamer1.0-plugins-base \
+	gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+	gstreamer1.0-plugins-ugly gstreamer1.0-libav
+```
+
+2. Install Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Verify RTSP support:
+
+```bash
+gst-inspect-1.0 rtspsrc
+```
+
+Expected result: plugin information is printed (not "No such element").
+
 ## Usage
 
 ### Standard Payload Mode
 
 ```bash
-cd payloadsdk_python/ui_demo
-python ui_demo.py
+cd PayloadSdk
+python ui_demo/ui_demo.py
 ```
 
 ### MB1 Payload Mode
 
 ```bash
-cd payloadsdk_python/ui_demo
-python ui_demo.py --mb1
+cd PayloadSdk
+python ui_demo/ui_demo.py --mb1
 ```
 
 ## Remote Command Bridge (MVP)
@@ -71,8 +101,8 @@ python remote_executor.py --role listen --host 0.0.0.0 --port 5000 --token my-sh
 ### 2) Start UI on operator machine in remote mode
 
 ```bash
-cd PayloadSdk/ui_demo
-python ui_demo.py \
+cd PayloadSdk
+python ui_demo/ui_demo.py \
 	--remote-mode connect \
 	--remote-host <gimbal_machine_vpn_ip> \
 	--remote-port 5000
@@ -81,7 +111,7 @@ python ui_demo.py \
 Optional token:
 
 ```bash
-python ui_demo.py --remote-mode connect --remote-host <gimbal_machine_vpn_ip> --remote-port 5000 --remote-token my-shared-token
+python ui_demo/ui_demo.py --remote-mode connect --remote-host <gimbal_machine_vpn_ip> --remote-port 5000 --remote-token my-shared-token
 ```
 
 Then in the UI:
