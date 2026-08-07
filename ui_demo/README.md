@@ -50,6 +50,59 @@ gst-inspect-1.0 rtspsrc
 
 Expected result: plugin information is printed (not "No such element").
 
+## Native Windows Setup
+
+The UI now includes native Windows video-sink handling for embedded playback in the GTK panel.
+
+Recommended setup path is MSYS2 (UCRT64) because it provides GTK + PyGObject + GStreamer together.
+
+1. Install MSYS2 from msys2.org.
+2. Open MSYS2 UCRT64 shell and install packages:
+
+```bash
+pacman -Syu
+pacman -S --needed \
+	mingw-w64-ucrt-x86_64-python \
+	mingw-w64-ucrt-x86_64-python-pip \
+	mingw-w64-ucrt-x86_64-python-gobject \
+	mingw-w64-ucrt-x86_64-gtk3 \
+	mingw-w64-ucrt-x86_64-gstreamer \
+	mingw-w64-ucrt-x86_64-gst-plugins-base \
+	mingw-w64-ucrt-x86_64-gst-plugins-good \
+	mingw-w64-ucrt-x86_64-gst-plugins-bad \
+	mingw-w64-ucrt-x86_64-gst-libav
+```
+
+3. In the same UCRT64 shell, install Python requirements:
+
+```bash
+cd /c/path/to/PayloadSdk
+pip install -r requirements.txt
+```
+
+4. Verify RTSP plugin support:
+
+```bash
+gst-inspect-1.0 rtspsrc
+```
+
+5. Run the UI:
+
+```bash
+cd /c/path/to/PayloadSdk/ui_demo
+python ui_demo.py
+```
+
+For remote mode:
+
+```bash
+python ui_demo.py --remote-mode connect --remote-host <gimbal_machine_vpn_ip> --remote-port 5000
+```
+
+Notes:
+- On Windows, the UI prefers `d3d11videosink`, then `d3dvideosink`, then `glimagesink` to keep video inside the GUI.
+- Use RTSP URL path `/eo` if your camera stream is `rtsp://<ip>:8554/eo`.
+
 ## Usage
 
 ### Standard Payload Mode
@@ -236,6 +289,10 @@ The UI follows the same callback-based event-driven architecture as the C++ vers
 - Check if RTSP URL is correct
 - Verify GStreamer plugins are installed
 - Check network connection to payload
+
+### Video pops out into separate window
+- Linux: run under X11 and ensure `ximagesink` or `glimagesink` is available.
+- Windows: run from MSYS2 UCRT64 shell so `d3d11videosink`/`d3dvideosink` plugins are available.
 
 ### Cannot connect to payload
 - Verify IP address is correct

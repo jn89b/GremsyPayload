@@ -12,6 +12,7 @@ from gi.repository import Gtk, Gdk, GLib, Gst, GstVideo
 
 import sys
 import os
+import platform
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'libs'))
 
 from config import ConnectionConfig
@@ -414,6 +415,7 @@ class PayloadSettingsTab(Gtk.Box):
         self.is_touch = False
         self.pipeline = None
         self.video_window_handle = 0
+        self.platform_system = platform.system().lower()
         self.fullscreen_window = None
         self.fullscreen_video_area = None
         self.fullscreen_video_handle = 0
@@ -1525,9 +1527,7 @@ class PayloadSettingsTab(Gtk.Box):
         """Handle video area realize"""
         window = widget.get_window()
         if window:
-            # Get X11 window ID for GStreamer
-            if hasattr(window, 'get_xid'):
-                self.video_window_handle = window.get_xid()
+            self.video_window_handle = self._get_native_window_handle(window)
 
     def _on_video_area_clicked(self, widget, event):
         """Handle video area click for touch/track"""
@@ -1603,8 +1603,8 @@ class PayloadSettingsTab(Gtk.Box):
     def _on_fullscreen_video_realize(self, widget):
         """Handle fullscreen video area realize"""
         window = widget.get_window()
-        if window and hasattr(window, 'get_xid'):
-            self.fullscreen_video_handle = window.get_xid()
+        if window:
+            self.fullscreen_video_handle = self._get_native_window_handle(window)
             # Redirect video to fullscreen window
             if self.pipeline:
                 vsink = self.pipeline.get_by_name('vsink')
@@ -1668,12 +1668,7 @@ class PayloadSettingsTab(Gtk.Box):
         if self.is_playing:
             self._stop_stream()
 
-        # Use overlay-capable sinks that render inside the GTK drawing area.
-        # Skip xvimagesink because many systems report "No Xv Port available".
-        sink_chain_candidates = [
-            "ximagesink name=vsink sync=false",
-            "glimagesink name=vsink sync=false",
-        ]
+        sink_chain_candidates = self._get_sink_chain_candidates()
 
         for sink_chain in sink_chain_candidates:
             pipeline_str = (
@@ -1722,6 +1717,34 @@ class PayloadSettingsTab(Gtk.Box):
                 self._cleanup_gstreamer()
 
         print("Failed to start pipeline")
+
+    def _get_sink_chain_candidates(self):
+        """Return platform-specific embedded sink candidates."""
+        if self.platform_system == "windows":
+            return [
+                "d3d11videosink name=vsink sync=false",
+                "d3dvideosink name=vsink sync=false",
+                "glimagesink name=vsink sync=false",
+            ]
+
+        # Linux/Unix default path.
+        return [
+            "ximagesink name=vsink sync=false",
+            "glimagesink name=vsink sync=false",
+        ]
+
+    @staticmethod
+    def _get_native_window_handle(window):
+        """Resolve native window handle for X11 or Win32 backends."""
+        for method_name in ("get_xid", "get_handle"):
+            if hasattr(window, method_name):
+                try:
+                    handle = getattr(window, method_name)()
+                    if handle:
+                        return int(handle)
+                except Exception:
+                    continue
+        return 0
 
     def _on_gst_error(self, bus, message):
         """Print detailed GStreamer error information."""
