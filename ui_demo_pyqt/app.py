@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ui_demo"))
 from config import ConnectionConfig, RemoteBridgeConfig
 from remote_bridge import BridgeConfig, TcpCommandBridge
 from widgets.video_widget import RtspVideoWidget
-
+# from ui_demo.remote_bridge import TcpCommandBridge
 CMD_PAYLOAD_TOUCH = "PAYLOAD_TOUCH"
 CMD_PAYLOAD_TRACK = "PAYLOAD_TRACK"
 
@@ -26,9 +26,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Payload UI Demo - PyQt MVP")
         self.resize(1400, 860)
 
-        self.bridge = None
-        self.bridge_connected = False
-        self.tracking_enabled = False
+        self.bridge: TcpCommandBridge | None = None
+        self.bridge_connected:bool = False
+        self.tracking_enabled:bool = False
 
         self._build_ui()
         self._apply_defaults(args)
@@ -180,7 +180,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tracking_enabled = bool(enabled)
         self._send_remote_command(CMD_PAYLOAD_TRACK, [float(enabled)])
 
-    def _on_video_clicked(self, x_widget: float, y_widget: float, frame_w: int, frame_h: int) -> None:
+    # def _on_video_clicked(self, x_widget: float, y_widget: float, frame_w: int, frame_h: int) -> None:
+    #     if not self.touch_checkbox.isChecked():
+    #         return
+
+    #     if frame_w <= 0 or frame_h <= 0:
+    #         self.status_label.setText("No frame available for click mapping")
+    #         return
+
+    #     view_w = max(1, self.video_widget.width())
+    #     view_h = max(1, self.video_widget.height())
+
+    #     # Map widget click to source frame coordinates with clamping.
+    #     x_src = max(0.0, min(float(frame_w - 1), (x_widget / view_w) * frame_w))
+    #     y_src = max(0.0, min(float(frame_h - 1), (y_widget / view_h) * frame_h))
+    #     print(f"Clicked at widget ({x_widget:.1f}, {y_widget:.1f}) -> source ({x_src:.1f}, {y_src:.1f})")
+    #     # Payload tracking API expects a 1280x720 coordinate space.
+    #     x_payload = int((x_src / max(1.0, frame_w)) * 1280)
+    #     y_payload = int((y_src / max(1.0, frame_h)) * 720)
+    #     print(f"Mapped to payload coordinates ({x_payload}, {y_payload})")
+
+    #     self._send_remote_command(CMD_PAYLOAD_TOUCH, [x_payload, y_payload])
+    def _on_video_clicked(
+        self,
+        x_widget: float,
+        y_widget: float,
+        frame_w: int,
+        frame_h: int,
+    ) -> None:
         if not self.touch_checkbox.isChecked():
             return
 
@@ -188,18 +215,54 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText("No frame available for click mapping")
             return
 
-        view_w = max(1, self.video_widget.width())
-        view_h = max(1, self.video_widget.height())
+        widget_w = self.video_widget.width()
+        widget_h = self.video_widget.height()
 
-        # Map widget click to source frame coordinates with clamping.
-        x_src = max(0.0, min(float(frame_w - 1), (x_widget / view_w) * frame_w))
-        y_src = max(0.0, min(float(frame_h - 1), (y_widget / view_h) * frame_h))
+        if widget_w <= 0 or widget_h <= 0:
+            return
 
-        # Payload tracking API expects a 1920x1080 coordinate space.
-        x_payload = int((x_src / max(1.0, frame_w)) * 1920)
-        y_payload = int((y_src / max(1.0, frame_h)) * 1080)
+        # Determine scale used by Qt.KeepAspectRatio.
+        scale = min(
+            widget_w / frame_w,
+            widget_h / frame_h,
+        )
 
+        displayed_w = frame_w * scale
+        displayed_h = frame_h * scale
+
+        # Centered video offsets caused by letterboxing.
+        offset_x = (widget_w - displayed_w) / 2.0
+        offset_y = (widget_h - displayed_h) / 2.0
+
+        # Ignore clicks outside the actual video.
+        if (
+            x_widget < offset_x
+            or x_widget >= offset_x + displayed_w
+            or y_widget < offset_y
+            or y_widget >= offset_y + displayed_h
+        ):
+            return
+
+        # Widget -> source image coordinates.
+        x_src = (x_widget - offset_x) / scale
+        y_src = (y_widget - offset_y) / scale
+
+        # Source image -> Gremsy 1920 x 1080 coordinates.
+        # This is hardcoded don't change the values even if you 
+        # change the configuration on the camera the backend maps to 1920x1080
+        x_payload = round((x_src / frame_w) * 1920)
+        y_payload = round((y_src / frame_h) * 1080)
+
+        x_payload = max(0, min(1919, x_payload))
+        y_payload = max(0, min(1079, y_payload))
+
+        print(
+            f"Widget click: ({x_widget:.1f}, {y_widget:.1f}) | "
+            f"Frame: ({x_src:.1f}, {y_src:.1f}) | "
+            f"Gremsy: ({x_payload}, {y_payload})"
+        )
         self._send_remote_command(CMD_PAYLOAD_TOUCH, [x_payload, y_payload])
+
 
     def _send_remote_command(self, command: str, params: List) -> None:
         if not self.bridge_connected or self.bridge is None:
