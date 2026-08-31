@@ -20,6 +20,12 @@ Click behavior
 - PAYLOAD_TOUCH [x, y]
     * point mode: TRACK_EAGLEEYES (move only)
     * track mode: TRACK_ACTIVE + acquire a fixed box around x/y
+
+Zoom behavior
+-------------
+- PAYLOAD_ZOOM_IN -> begin continuous zoom in
+- PAYLOAD_ZOOM_OUT -> begin continuous zoom out
+- PAYLOAD_ZOOM_STOP -> stop continuous zoom
 """
 
 import argparse
@@ -47,6 +53,7 @@ try:
         tracking_mode_t,
     )
     from config import ConnectionConfig
+    from payload_define import camera_zoom_value
 except ImportError as exc:
     print(f"Error importing payload SDK modules: {exc}")
     sys.exit(1)
@@ -55,6 +62,9 @@ except ImportError as exc:
 CMD_PAYLOAD_TOUCH = "PAYLOAD_TOUCH"
 CMD_PAYLOAD_TRACK = "PAYLOAD_TRACK"
 CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
+CMD_PAYLOAD_ZOOM_IN = "PAYLOAD_ZOOM_IN"
+CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
+CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
 
 GREMSY_FRAME_W = 1920
 GREMSY_FRAME_H = 1080
@@ -193,6 +203,18 @@ class RemoteExecutor:
 
         if self.sdk:
             try:
+                if self.is_connected:
+                    try:
+                        with self._sdk_send_lock:
+                            self.sdk.setCameraZoom(
+                                mavutil.mavlink.ZOOM_TYPE_CONTINUOUS,
+                                camera_zoom_value.ZOOM_STOP,
+                            )
+                    except Exception as exc:
+                        self._log(
+                            f"failed stopping zoom during shutdown: {exc}"
+                        )
+
                 self.sdk.sdkQuit()
             finally:
                 self.sdk = None
@@ -602,6 +624,33 @@ class RemoteExecutor:
                     )
 
                 return True, f"camera point command sent x={x} y={y}"
+
+            if command == CMD_PAYLOAD_ZOOM_IN:
+                with self._sdk_send_lock:
+                    self.sdk.setCameraZoom(
+                        mavutil.mavlink.ZOOM_TYPE_CONTINUOUS,
+                        camera_zoom_value.ZOOM_IN,
+                    )
+
+                return True, "continuous zoom in started"
+
+            if command == CMD_PAYLOAD_ZOOM_OUT:
+                with self._sdk_send_lock:
+                    self.sdk.setCameraZoom(
+                        mavutil.mavlink.ZOOM_TYPE_CONTINUOUS,
+                        camera_zoom_value.ZOOM_OUT,
+                    )
+
+                return True, "continuous zoom out started"
+
+            if command == CMD_PAYLOAD_ZOOM_STOP:
+                with self._sdk_send_lock:
+                    self.sdk.setCameraZoom(
+                        mavutil.mavlink.ZOOM_TYPE_CONTINUOUS,
+                        camera_zoom_value.ZOOM_STOP,
+                    )
+
+                return True, "zoom stopped"
 
             return False, f"unsupported command: {command}"
 
