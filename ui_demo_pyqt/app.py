@@ -11,6 +11,10 @@ Interaction model
 - Track checked:
     click video -> begin Gremsy object tracking at clicked image pixel.
 
+- Zoom buttons:
+    press and hold Zoom In / Zoom Out -> continuous zoom.
+    release -> stop zoom.
+
 Geolocation is optional:
 - After the remote bridge connects, the UI waits --geo-timeout seconds for
   GEO_STATUS events from the backend.
@@ -38,9 +42,11 @@ The remote executor should periodically publish:
 """
 
 import argparse
+import json
 import math
 import os
 import sys
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -71,8 +77,10 @@ from widgets.video_widget import RtspVideoWidget
 
 CMD_PAYLOAD_TOUCH = "PAYLOAD_TOUCH"
 CMD_PAYLOAD_TRACK = "PAYLOAD_TRACK"
-
-EVENT_GEO_STATUS = "GEO_STATUS"
+CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
+CMD_PAYLOAD_ZOOM_IN = "PAYLOAD_ZOOM_IN"
+CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
+CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
 
 GREMSY_FRAME_W = 1920
 GREMSY_FRAME_H = 1080
@@ -80,13 +88,10 @@ GREMSY_FRAME_H = 1080
 DEFAULT_GEO_TIMEOUT_S = 8.0
 
 
-class BridgeSignals(QtCore.QObject):
-    """
-    Thread-safe handoff from TcpCommandBridge worker threads into Qt.
-    """
+class GeoPollSignals(QtCore.QObject):
+    """Thread-safe handoff from geolocation polling thread into Qt."""
 
-    event_received = QtCore.Signal(str, object)
-    connection_changed = QtCore.Signal(bool)
+    result = QtCore.Signal(bool, str)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -94,13 +99,16 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
 
         self.setWindowTitle(
-            "Payload UI Demo - Click / Track"
+            "Payload UI Demo - Click / Track / Zoom"
         )
         self.resize(1400, 900)
 
         self.bridge: Optional[TcpCommandBridge] = None
         self.bridge_connected = False
         self.tracking_enabled = False
+        self.zoom_active = False
+        self.geo_poll_in_flight = False
+        self._last_bridge_state = False
 
         # --------------------------------------------------------------
         # Optional geolocation state
@@ -122,12 +130,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.target_lon: Optional[float] = None
         self.target_alt: Optional[float] = None
 
-        self.bridge_signals = BridgeSignals()
-        self.bridge_signals.event_received.connect(
-            self._on_bridge_event
-        )
-        self.bridge_signals.connection_changed.connect(
-            self._on_bridge_connection_changed
+        self.geo_poll_signals = GeoPollSignals()
+        self.geo_poll_signals.result.connect(
+            self._on_geo_poll_result
         )
 
         self._build_ui()
@@ -136,9 +141,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Periodically checks whether the optional geolocation grace
         # period has expired.
         self.geo_timer = QtCore.QTimer(self)
-        self.geo_timer.setInterval(250)
+        self.geo_timer.setInterval(1000)
         self.geo_timer.timeout.connect(
-            self._update_geo_timeout_state
+            self._periodic_status_update
         )
         self.geo_timer.start()
 
@@ -382,6 +387,32 @@ class MainWindow(QtWidgets.QMainWindow):
             "font-weight: 600;"
         )
 
+        self.zoom_out_button = QtWidgets.QPushButton(
+            "Zoom Out -"
+        )
+        self.zoom_out_button.setToolTip(
+            "Press and hold to zoom out; release to stop."
+        )
+        self.zoom_out_button.pressed.connect(
+            self._zoom_out_pressed
+        )
+        self.zoom_out_button.released.connect(
+            self._zoom_released
+        )
+
+        self.zoom_in_button = QtWidgets.QPushButton(
+            "Zoom In +"
+        )
+        self.zoom_in_button.setToolTip(
+            "Press and hold to zoom in; release to stop."
+        )
+        self.zoom_in_button.pressed.connect(
+            self._zoom_in_pressed
+        )
+        self.zoom_in_button.released.connect(
+            self._zoom_released
+        )
+
         self.status_label = QtWidgets.QLabel(
             "Ready"
         )
@@ -397,6 +428,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         controls_row.addWidget(
             self.mode_label
+        )
+        controls_row.addSpacing(24)
+        controls_row.addWidget(
+            self.zoom_out_button
+        )
+        controls_row.addWidget(
+            self.zoom_in_button
         )
         controls_row.addStretch(1)
         controls_row.addWidget(
@@ -463,22 +501,6 @@ class MainWindow(QtWidgets.QMainWindow):
             logger=self._bridge_log,
         )
 
-        # Worker-thread callbacks -> Qt signals -> GUI thread.
-        self.bridge.set_event_handler(
-            lambda event_name, data:
-                self.bridge_signals.event_received.emit(
-                    event_name,
-                    data,
-                )
-        )
-
-        self.bridge.set_connection_handler(
-            lambda connected:
-                self.bridge_signals.connection_changed.emit(
-                    connected
-                )
-        )
-
         self.bridge.start()
 
         self.connect_button.setText(
@@ -510,15 +532,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Bridge listening - waiting for executor"
             )
 
-    @QtCore.Slot(bool)
-    def _on_bridge_connection_changed(
-        self,
-        connected: bool,
-    ) -> None:
-        if connected:
-            self._mark_bridge_connected()
-        else:
-            self._mark_bridge_disconnected()
 
     def _mark_bridge_connected(self) -> None:
         was_connected = self.bridge_connected
@@ -547,6 +560,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 0,
                 self._sync_tracking_mode,
             )
+            QtCore.QTimer.singleShot(
+                0,
+                self._sync_zoom_stop,
+            )
+
+    def _sync_zoom_stop(self) -> None:
+        if not self.bridge_connected:
+            return
+
+        self._send_remote_command(
+            CMD_PAYLOAD_ZOOM_STOP,
+            [],
+        )
 
     def _mark_bridge_disconnected(self) -> None:
         self.bridge_connected = False
@@ -583,12 +609,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge = None
 
         if bridge is not None:
-            bridge.set_event_handler(None)
-            bridge.set_connection_handler(None)
+            if self.bridge_connected:
+                try:
+                    bridge.send_command(
+                        command=CMD_PAYLOAD_ZOOM_STOP,
+                        params=[],
+                        ack_required=True,
+                    )
+                except Exception:
+                    pass
             bridge.stop()
 
         self.bridge_connected = False
         self.tracking_enabled = False
+        self.zoom_active = False
+        self.geo_poll_in_flight = False
 
         self.connect_button.setText(
             "Connect Bridge"
@@ -706,20 +741,84 @@ class MainWindow(QtWidgets.QMainWindow):
             message
         )
 
-    @QtCore.Slot(str, object)
-    def _on_bridge_event(
-        self,
-        event_name: str,
-        data_obj: object,
-    ) -> None:
-        if event_name != EVENT_GEO_STATUS:
+    def _periodic_status_update(self) -> None:
+        """
+        Monitor bridge connection, poll geolocation without blocking Qt,
+        and update the optional geolocation timeout warning.
+        """
+        bridge_now_connected = (
+            self.bridge is not None
+            and self.bridge.is_connected()
+        )
+
+        if bridge_now_connected and not self.bridge_connected:
+            self._mark_bridge_connected()
+        elif not bridge_now_connected and self.bridge_connected:
+            self._mark_bridge_disconnected()
+
+        if (
+            self.bridge_connected
+            and not self.geo_poll_in_flight
+        ):
+            self._start_geo_poll()
+
+        self._update_geo_timeout_state()
+
+    def _start_geo_poll(self) -> None:
+        bridge = self.bridge
+
+        if (
+            bridge is None
+            or not bridge.is_connected()
+            or self.geo_poll_in_flight
+        ):
             return
 
-        data = (
-            data_obj
-            if isinstance(data_obj, dict)
-            else {}
-        )
+        self.geo_poll_in_flight = True
+
+        def worker() -> None:
+            try:
+                ok, detail = bridge.send_command(
+                    command=CMD_GET_GEO_STATUS,
+                    params=[],
+                    ack_required=True,
+                )
+            except Exception as exc:
+                ok = False
+                detail = f"geolocation poll error: {exc}"
+
+            self.geo_poll_signals.result.emit(
+                ok,
+                detail,
+            )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="geo-status-poll",
+        ).start()
+
+    @QtCore.Slot(bool, str)
+    def _on_geo_poll_result(
+        self,
+        ok: bool,
+        detail: str,
+    ) -> None:
+        self.geo_poll_in_flight = False
+
+        if not ok:
+            return
+
+        try:
+            data = json.loads(detail)
+        except Exception as exc:
+            print(
+                f"[GEO] invalid GET_GEO_STATUS response: {exc}"
+            )
+            return
+
+        if not isinstance(data, dict):
+            return
 
         self.last_geo_event_time = time.monotonic()
 
@@ -782,15 +881,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._refresh_target_position_label()
 
-        detail = str(
+        status_detail = str(
             data.get("detail", "")
         ).strip()
 
         if self.geolocation_available:
             self.geo_timeout_notified = False
-
             self._set_geo_status_ok(
-                detail
+                status_detail
                 or "Geolocation available"
             )
             return
@@ -798,7 +896,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._geo_deadline_expired():
             if self.ardupilot_connected:
                 self._set_geo_status_waiting(
-                    detail
+                    status_detail
                     or (
                         "ArduPilot connected; "
                         "waiting for valid GPS/geolocation."
@@ -806,7 +904,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             else:
                 self._set_geo_status_waiting(
-                    detail
+                    status_detail
                     or (
                         f"Waiting for ArduPilot "
                         f"({self.geo_timeout_s:.1f}s grace period)."
@@ -815,7 +913,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self._notify_geo_unavailable_once(
-            detail
+            status_detail
         )
 
     def _update_geo_timeout_state(self) -> None:
@@ -1059,6 +1157,63 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     # ------------------------------------------------------------------
+    # Zoom
+    # ------------------------------------------------------------------
+
+    def _zoom_in_pressed(self) -> None:
+        if not self.bridge_connected:
+            self.status_label.setText(
+                "Bridge offline - cannot zoom"
+            )
+            return
+
+        ok, _ = self._send_remote_command(
+            CMD_PAYLOAD_ZOOM_IN,
+            [],
+        )
+
+        if ok:
+            self.zoom_active = True
+            self.status_label.setText(
+                "Zooming in..."
+            )
+
+    def _zoom_out_pressed(self) -> None:
+        if not self.bridge_connected:
+            self.status_label.setText(
+                "Bridge offline - cannot zoom"
+            )
+            return
+
+        ok, _ = self._send_remote_command(
+            CMD_PAYLOAD_ZOOM_OUT,
+            [],
+        )
+
+        if ok:
+            self.zoom_active = True
+            self.status_label.setText(
+                "Zooming out..."
+            )
+
+    def _zoom_released(self) -> None:
+        if not self.bridge_connected:
+            self.zoom_active = False
+            return
+
+        ok, _ = self._send_remote_command(
+            CMD_PAYLOAD_ZOOM_STOP,
+            [],
+        )
+
+        self.zoom_active = False
+
+        if ok:
+            self.status_label.setText(
+                "Zoom stopped"
+            )
+
+    # ------------------------------------------------------------------
     # Coordinate conversion
     # ------------------------------------------------------------------
 
@@ -1223,6 +1378,14 @@ class MainWindow(QtWidgets.QMainWindow):
         event: QtGui.QCloseEvent,
     ) -> None:
         if self.bridge_connected:
+            try:
+                self._send_remote_command(
+                    CMD_PAYLOAD_ZOOM_STOP,
+                    [],
+                )
+            except Exception:
+                pass
+
             try:
                 self._send_remote_command(
                     CMD_PAYLOAD_TRACK,
