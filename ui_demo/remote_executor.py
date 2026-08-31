@@ -93,7 +93,7 @@ class RemoteExecutor:
             self.sdk.sdkQuit()
             self.sdk = None
         self._log("executor stopped")
-
+    
     def _wait_payload_connection(self, timeout: float) -> bool:
         start = time.time()
         while self.running and (time.time() - start) < timeout:
@@ -113,7 +113,9 @@ class RemoteExecutor:
             if command == CMD_PAYLOAD_TOUCH:
                 x = int(params[0]) if len(params) > 0 else 960
                 y = int(params[1]) if len(params) > 1 else 540
+        
                 self.sdk.setPayloadObjectTrackingPosition(x, y)
+                print("Sending commands at", x,y)
                 return True, f"tracking position set x={x} y={y}"
 
             if command == CMD_PAYLOAD_TRACK:

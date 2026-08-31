@@ -28,7 +28,7 @@ class ConnectionConfig:
     CONTROL_METHOD = CONTROL_UDP
     
     # UDP Configuration
-    UDP_IP_TARGET = "100.89.182.15"      # Payload IP address
+    UDP_IP_TARGET = "192.168.1.240"      # Payload IP address
     UDP_PORT_TARGET = 14566             # Do not change
 
     # RTSP defaults for UI streaming preview

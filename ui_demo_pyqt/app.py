@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
-"""PyQt remote gimbal UI MVP with embedded RTSP and click-to-track."""
+# pyright: reportMissingImports=false
+"""
+PyQt remote Gremsy payload UI.
+
+Interaction model
+-----------------
+- Track unchecked:
+    click video -> move gimbal to clicked image pixel only.
+
+- Track checked:
+    click video -> begin Gremsy object tracking at clicked image pixel.
+
+The UI always sends PAYLOAD_TOUCH [x, y] for a click.
+PAYLOAD_TRACK [1/0] only tells the remote executor which behavior to use.
+"""
 
 import argparse
 import os
 import sys
-from typing import List
+from typing import List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -15,20 +29,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ui_demo"))
 from config import ConnectionConfig, RemoteBridgeConfig
 from remote_bridge import BridgeConfig, TcpCommandBridge
 from widgets.video_widget import RtspVideoWidget
-# from ui_demo.remote_bridge import TcpCommandBridge
+
+
 CMD_PAYLOAD_TOUCH = "PAYLOAD_TOUCH"
 CMD_PAYLOAD_TRACK = "PAYLOAD_TRACK"
+
+GREMSY_FRAME_W = 1920
+GREMSY_FRAME_H = 1080
 
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, args: argparse.Namespace):
         super().__init__()
-        self.setWindowTitle("Payload UI Demo - PyQt MVP")
+
+        self.setWindowTitle("Payload UI Demo - Click / Track")
         self.resize(1400, 860)
 
-        self.bridge: TcpCommandBridge | None = None
-        self.bridge_connected:bool = False
-        self.tracking_enabled:bool = False
+        self.bridge: Optional[TcpCommandBridge] = None
+        self.bridge_connected = False
+        self.tracking_enabled = False
 
         self._build_ui()
         self._apply_defaults(args)
@@ -41,6 +60,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
+        # --------------------------------------------------------------
+        # Remote bridge
+        # --------------------------------------------------------------
         conn_group = QtWidgets.QGroupBox("Remote Bridge")
         conn_grid = QtWidgets.QGridLayout(conn_group)
 
@@ -48,8 +70,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.role_combo.addItems(["connect", "listen"])
 
         self.host_edit = QtWidgets.QLineEdit()
+
         self.port_spin = QtWidgets.QSpinBox()
         self.port_spin.setRange(1, 65535)
+
         self.token_edit = QtWidgets.QLineEdit()
         self.token_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
 
@@ -70,6 +94,9 @@ class MainWindow(QtWidgets.QMainWindow):
         conn_grid.addWidget(self.connect_button, 0, 8)
         conn_grid.addWidget(self.bridge_status, 0, 9)
 
+        # --------------------------------------------------------------
+        # RTSP stream controls
+        # --------------------------------------------------------------
         stream_group = QtWidgets.QGroupBox("RTSP Stream")
         stream_layout = QtWidgets.QHBoxLayout(stream_group)
 
@@ -78,6 +105,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.play_button = QtWidgets.QPushButton("Play")
         self.play_button.clicked.connect(self._start_stream)
+
         self.stop_button = QtWidgets.QPushButton("Stop")
         self.stop_button.clicked.connect(self._stop_stream)
 
@@ -85,21 +113,35 @@ class MainWindow(QtWidgets.QMainWindow):
         stream_layout.addWidget(self.play_button)
         stream_layout.addWidget(self.stop_button)
 
+        # --------------------------------------------------------------
+        # Video
+        # --------------------------------------------------------------
         self.video_widget = RtspVideoWidget()
         self.video_widget.clicked.connect(self._on_video_clicked)
 
+        # --------------------------------------------------------------
+        # Video controls
+        # --------------------------------------------------------------
         controls_row = QtWidgets.QHBoxLayout()
-        self.touch_checkbox = QtWidgets.QCheckBox("Touch")
-        self.touch_checkbox.setChecked(True)
 
         self.track_checkbox = QtWidgets.QCheckBox("Track")
+        self.track_checkbox.setToolTip(
+            "Unchecked: click moves camera. Checked: click begins object tracking."
+        )
         self.track_checkbox.stateChanged.connect(self._on_track_toggled)
+
+        self.stop_tracking_button = QtWidgets.QPushButton("Stop Tracking")
+        self.stop_tracking_button.clicked.connect(self._stop_tracking)
+
+        self.mode_label = QtWidgets.QLabel("Click mode: Point Camera")
+        self.mode_label.setStyleSheet("font-weight: 600;")
 
         self.status_label = QtWidgets.QLabel("Ready")
         self.status_label.setStyleSheet("color: #38bdf8;")
 
-        controls_row.addWidget(self.touch_checkbox)
         controls_row.addWidget(self.track_checkbox)
+        controls_row.addWidget(self.stop_tracking_button)
+        controls_row.addWidget(self.mode_label)
         controls_row.addStretch(1)
         controls_row.addWidget(self.status_label)
 
@@ -116,9 +158,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         default_rtsp_url = (
             f"rtsp://{ConnectionConfig.UDP_IP_TARGET}:"
-            f"{ConnectionConfig.RTSP_PORT_TARGET}/{ConnectionConfig.RTSP_PATH_TARGET}"
+            f"{ConnectionConfig.RTSP_PORT_TARGET}/"
+            f"{ConnectionConfig.RTSP_PATH_TARGET}"
         )
         self.rtsp_url_edit.setText(default_rtsp_url)
+
+    # ------------------------------------------------------------------
+    # Bridge
+    # ------------------------------------------------------------------
 
     def _toggle_bridge(self) -> None:
         if self.bridge_connected:
@@ -140,7 +187,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge.start()
 
         if cfg.role == "connect":
-            connected = self.bridge.wait_until_connected(RemoteBridgeConfig.CONNECT_TIMEOUT)
+            connected = self.bridge.wait_until_connected(
+                RemoteBridgeConfig.CONNECT_TIMEOUT
+            )
             if not connected:
                 self.status_label.setText("Bridge connect timeout")
                 self._disconnect_bridge()
@@ -152,15 +201,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge_status.setStyleSheet("color: #16a34a; font-weight: 600;")
         self.status_label.setText("Bridge ready")
 
+        # Synchronize backend mode with current checkbox state.
+        self._send_remote_command(
+            CMD_PAYLOAD_TRACK,
+            [1 if self.track_checkbox.isChecked() else 0],
+        )
+
     def _disconnect_bridge(self) -> None:
         if self.bridge is not None:
             self.bridge.stop()
             self.bridge = None
 
         self.bridge_connected = False
+        self.tracking_enabled = False
+
         self.connect_button.setText("Connect Bridge")
         self.bridge_status.setText("Disconnected")
         self.bridge_status.setStyleSheet("color: #e11d48; font-weight: 600;")
+
+    def _send_remote_command(
+        self,
+        command: str,
+        params: List,
+    ) -> Tuple[bool, str]:
+        if not self.bridge_connected or self.bridge is None:
+            detail = f"Bridge offline, skipped {command}"
+            self.status_label.setText(detail)
+            return False, detail
+
+        ok, detail = self.bridge.send_command(
+            command=command,
+            params=params,
+            ack_required=True,
+        )
+
+        if ok:
+            self.status_label.setText(f"ACK {command}: {detail}")
+        else:
+            self.status_label.setText(f"NACK {command}: {detail}")
+
+        return ok, detail
+
+    def _bridge_log(self, msg: str) -> None:
+        print(msg)
+
+    # ------------------------------------------------------------------
+    # RTSP
+    # ------------------------------------------------------------------
 
     def _start_stream(self) -> None:
         url = self.rtsp_url_edit.text().strip()
@@ -169,59 +256,77 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         ok = self.video_widget.start_stream(url)
-        self.status_label.setText("Stream playing" if ok else "Failed to open stream")
+        self.status_label.setText(
+            "Stream playing" if ok else "Failed to open stream"
+        )
 
     def _stop_stream(self) -> None:
         self.video_widget.stop_stream()
         self.status_label.setText("Stream stopped")
 
+    # ------------------------------------------------------------------
+    # Tracking mode
+    # ------------------------------------------------------------------
+
     def _on_track_toggled(self, state: int) -> None:
-        enabled = 1 if state == QtCore.Qt.CheckState.Checked else 0
-        self.tracking_enabled = bool(enabled)
-        self._send_remote_command(CMD_PAYLOAD_TRACK, [float(enabled)])
+        enabled = state == QtCore.Qt.CheckState.Checked.value
+        self.tracking_enabled = enabled
 
-    # def _on_video_clicked(self, x_widget: float, y_widget: float, frame_w: int, frame_h: int) -> None:
-    #     if not self.touch_checkbox.isChecked():
-    #         return
+        if enabled:
+            self.mode_label.setText("Click mode: Track Target")
+            self.status_label.setText("Track enabled - click a target")
+        else:
+            self.mode_label.setText("Click mode: Point Camera")
+            self.status_label.setText("Track disabled - click to point camera")
 
-    #     if frame_w <= 0 or frame_h <= 0:
-    #         self.status_label.setText("No frame available for click mapping")
-    #         return
+        if self.bridge_connected:
+            self._send_remote_command(
+                CMD_PAYLOAD_TRACK,
+                [1 if enabled else 0],
+            )
 
-    #     view_w = max(1, self.video_widget.width())
-    #     view_h = max(1, self.video_widget.height())
+    def _stop_tracking(self) -> None:
+        # Stop tracker and return to normal point-camera behavior.
+        if self.bridge_connected:
+            ok, _ = self._send_remote_command(
+                CMD_PAYLOAD_TRACK,
+                [0],
+            )
+        else:
+            ok = False
 
-    #     # Map widget click to source frame coordinates with clamping.
-    #     x_src = max(0.0, min(float(frame_w - 1), (x_widget / view_w) * frame_w))
-    #     y_src = max(0.0, min(float(frame_h - 1), (y_widget / view_h) * frame_h))
-    #     print(f"Clicked at widget ({x_widget:.1f}, {y_widget:.1f}) -> source ({x_src:.1f}, {y_src:.1f})")
-    #     # Payload tracking API expects a 1280x720 coordinate space.
-    #     x_payload = int((x_src / max(1.0, frame_w)) * 1280)
-    #     y_payload = int((y_src / max(1.0, frame_h)) * 720)
-    #     print(f"Mapped to payload coordinates ({x_payload}, {y_payload})")
+        self.tracking_enabled = False
 
-    #     self._send_remote_command(CMD_PAYLOAD_TOUCH, [x_payload, y_payload])
-    def _on_video_clicked(
+        self.track_checkbox.blockSignals(True)
+        self.track_checkbox.setChecked(False)
+        self.track_checkbox.blockSignals(False)
+
+        self.mode_label.setText("Click mode: Point Camera")
+
+        if ok:
+            self.status_label.setText("Tracking stopped")
+
+    # ------------------------------------------------------------------
+    # Coordinate conversion
+    # ------------------------------------------------------------------
+
+    def _widget_point_to_payload(
         self,
         x_widget: float,
         y_widget: float,
         frame_w: int,
         frame_h: int,
-    ) -> None:
-        if not self.touch_checkbox.isChecked():
-            return
-
+    ) -> Optional[Tuple[int, int]]:
         if frame_w <= 0 or frame_h <= 0:
-            self.status_label.setText("No frame available for click mapping")
-            return
+            return None
 
         widget_w = self.video_widget.width()
         widget_h = self.video_widget.height()
 
         if widget_w <= 0 or widget_h <= 0:
-            return
+            return None
 
-        # Determine scale used by Qt.KeepAspectRatio.
+        # Qt KeepAspectRatio scaling used by the video widget.
         scale = min(
             widget_w / frame_w,
             widget_h / frame_h,
@@ -230,79 +335,129 @@ class MainWindow(QtWidgets.QMainWindow):
         displayed_w = frame_w * scale
         displayed_h = frame_h * scale
 
-        # Centered video offsets caused by letterboxing.
         offset_x = (widget_w - displayed_w) / 2.0
         offset_y = (widget_h - displayed_h) / 2.0
 
-        # Ignore clicks outside the actual video.
+        # Ignore clicks in black letterbox / pillarbox space.
         if (
             x_widget < offset_x
             or x_widget >= offset_x + displayed_w
             or y_widget < offset_y
             or y_widget >= offset_y + displayed_h
         ):
-            return
+            return None
 
-        # Widget -> source image coordinates.
+        # Widget coordinates -> actual RTSP source-frame coordinates.
         x_src = (x_widget - offset_x) / scale
         y_src = (y_widget - offset_y) / scale
 
-        # Source image -> Gremsy 1920 x 1080 coordinates.
-        # This is hardcoded don't change the values even if you 
-        # change the configuration on the camera the backend maps to 1920x1080
-        x_payload = round((x_src / frame_w) * 1920)
-        y_payload = round((y_src / frame_h) * 1080)
+        # Source frame -> Gremsy's fixed 1920 x 1080 image coordinate space.
+        x_payload = round((x_src / frame_w) * GREMSY_FRAME_W)
+        y_payload = round((y_src / frame_h) * GREMSY_FRAME_H)
 
-        x_payload = max(0, min(1919, x_payload))
-        y_payload = max(0, min(1079, y_payload))
+        x_payload = max(0, min(GREMSY_FRAME_W - 1, x_payload))
+        y_payload = max(0, min(GREMSY_FRAME_H - 1, y_payload))
 
-        print(
-            f"Widget click: ({x_widget:.1f}, {y_widget:.1f}) | "
-            f"Frame: ({x_src:.1f}, {y_src:.1f}) | "
-            f"Gremsy: ({x_payload}, {y_payload})"
+        return x_payload, y_payload
+
+    # ------------------------------------------------------------------
+    # Click handler
+    # ------------------------------------------------------------------
+
+    def _on_video_clicked(
+        self,
+        x_widget: float,
+        y_widget: float,
+        frame_w: int,
+        frame_h: int,
+    ) -> None:
+        point = self._widget_point_to_payload(
+            x_widget,
+            y_widget,
+            frame_w,
+            frame_h,
         )
-        self._send_remote_command(CMD_PAYLOAD_TOUCH, [x_payload, y_payload])
 
-
-    def _send_remote_command(self, command: str, params: List) -> None:
-        if not self.bridge_connected or self.bridge is None:
-            self.status_label.setText(f"Bridge offline, skipped {command}")
+        if point is None:
+            self.status_label.setText("Click inside the actual video image")
             return
 
-        ok, detail = self.bridge.send_command(command=command, params=params, ack_required=True)
-        if ok:
-            self.status_label.setText(f"ACK {command}: {detail}")
-        else:
-            self.status_label.setText(f"NACK {command}: {detail}")
+        x_payload, y_payload = point
 
-    def _bridge_log(self, msg: str) -> None:
-        print(msg)
+        action = "TRACK" if self.tracking_enabled else "POINT"
+        print(
+            f"[{action}] widget=({x_widget:.1f}, {y_widget:.1f}) "
+            f"Gremsy=({x_payload}, {y_payload})"
+        )
+
+        # The backend decides whether this click means EagleEyes move-only
+        # or TRACK_ACTIVE based on the PAYLOAD_TRACK mode previously sent.
+        ok, _ = self._send_remote_command(
+            CMD_PAYLOAD_TOUCH,
+            [x_payload, y_payload],
+        )
+
+        if ok:
+            if self.tracking_enabled:
+                self.status_label.setText(
+                    f"Tracking target at ({x_payload}, {y_payload})"
+                )
+            else:
+                self.status_label.setText(
+                    f"Camera moving to ({x_payload}, {y_payload})"
+                )
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.bridge_connected:
+            try:
+                self._send_remote_command(CMD_PAYLOAD_TRACK, [0])
+            except Exception:
+                pass
+
         self.video_widget.stop_stream()
         self._disconnect_bridge()
         super().closeEvent(event)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Payload PyQt UI Demo MVP")
+    parser = argparse.ArgumentParser(
+        description="Payload PyQt UI - click to point or click to track"
+    )
+
     parser.add_argument(
         "--remote-mode",
         choices=["connect", "listen"],
         default="connect",
         help="Remote bridge role for this UI process",
     )
-    parser.add_argument("--remote-host", default=RemoteBridgeConfig.HOST)
-    parser.add_argument("--remote-port", type=int, default=RemoteBridgeConfig.PORT)
-    parser.add_argument("--remote-token", default=RemoteBridgeConfig.TOKEN)
+    parser.add_argument(
+        "--remote-host",
+        default=RemoteBridgeConfig.HOST,
+    )
+    parser.add_argument(
+        "--remote-port",
+        type=int,
+        default=RemoteBridgeConfig.PORT,
+    )
+    parser.add_argument(
+        "--remote-token",
+        default=RemoteBridgeConfig.TOKEN,
+    )
+
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow(args)
     window.show()
+
     return app.exec()
 
 

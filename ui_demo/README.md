@@ -138,11 +138,7 @@ This repository now includes an MVP remote-control split for click-to-track:
 
 ```bash
 cd PayloadSdk/ui_demo
-python remote_executor.py \
-	--role listen \
-	--host 0.0.0.0 \
-	--port 5000 \
-	--payload-ip 192.168.55.1
+python remote_executor.py --role listen --host 0.0.0.0 --port 5000 --payload-ip 192.168.55.1
 ```
 
 Optional token:
