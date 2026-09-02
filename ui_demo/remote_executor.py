@@ -1,31 +1,50 @@
 #!/usr/bin/env python3
 # pyright: reportMissingImports=false
 """
-Remote executor service.
+Remote executor service for Gremsy Lynx.
 
 Runs on the machine physically connected to the Gremsy payload/gimbal.
-Receives remote UI commands over TCP and executes a safe command subset.
 
-Optional ArduPilot geolocation path
------------------------------------
-- A background pymavlink connection listens for ArduPilot telemetry.
-- GLOBAL_POSITION_INT and GPS_RAW_INT are forwarded into the Gremsy payload.
-- Gremsy TARGET_LAT/TARGET_LON/TARGET_ALT parameters are monitored.
-- The UI polls GET_GEO_STATUS; lack of ArduPilot never blocks gimbal control.
+Features
+--------
+- Click to point camera (EagleEyes)
+- Click to track
+- Continuous zoom in / out / stop
+- Optional ArduPilot MAVLink input
+- Forwards ArduPilot GPS into Gremsy
+- Receives:
+    * vehicle GPS + relative altitude
+    * vehicle roll/pitch/yaw
+    * Gremsy gimbal roll/pitch/yaw
+    * Gremsy tracking pixel
+    * Gremsy EO camera FOV
+- Computes an approximate target GPS location by intersecting the camera
+  line-of-sight ray with a flat ground plane.
+- GET_GEO_STATUS returns the live estimator state to the PyQt UI.
 
-Click behavior
---------------
-- PAYLOAD_TRACK [0] -> point-camera mode.
-- PAYLOAD_TRACK [1] -> click-to-track mode.
-- PAYLOAD_TOUCH [x, y]
-    * point mode: TRACK_EAGLEEYES (move only)
-    * track mode: TRACK_ACTIVE + acquire a fixed box around x/y
+IMPORTANT
+---------
+This is a geometric estimate, NOT a surveyed target position.
 
-Zoom behavior
--------------
-- PAYLOAD_ZOOM_IN -> begin continuous zoom in
-- PAYLOAD_ZOOM_OUT -> begin continuous zoom out
-- PAYLOAD_ZOOM_STOP -> stop continuous zoom
+Without an LRF or terrain model, target range comes from a flat-ground
+intersection. Accuracy is sensitive to:
+- camera/gimbal attitude error
+- vehicle attitude error
+- GPS error
+- camera mounting offsets
+- ground-height error
+- near-horizon geometry
+
+For ground testing, use:
+    --camera-height-agl <meters>
+
+Example:
+    python3 remote_executor.py \
+        --ardupilot-endpoint udpin:0.0.0.0:14555 \
+        --camera-height-agl 2.0
+
+For flight over reasonably flat terrain you can omit --camera-height-agl.
+The estimator then falls back to GLOBAL_POSITION_INT.relative_alt.
 """
 
 import argparse
@@ -35,17 +54,25 @@ import os
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-# Add libs path.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "libs"))
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "libs",
+    ),
+)
 
 from remote_bridge import BridgeConfig, TcpCommandBridge
 
 try:
     from pymavlink import mavutil
+    from payload_define import camera_zoom_value
     from payload_sdk import (
         PayloadSdkInterface,
+        camera_type_t,
         mavlink_global_position_int_t,
         mavlink_gps_raw_int_t,
         payload_param_t,
@@ -53,7 +80,6 @@ try:
         tracking_mode_t,
     )
     from config import ConnectionConfig
-    from payload_define import camera_zoom_value
 except ImportError as exc:
     print(f"Error importing payload SDK modules: {exc}")
     sys.exit(1)
@@ -61,10 +87,10 @@ except ImportError as exc:
 
 CMD_PAYLOAD_TOUCH = "PAYLOAD_TOUCH"
 CMD_PAYLOAD_TRACK = "PAYLOAD_TRACK"
-CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
 CMD_PAYLOAD_ZOOM_IN = "PAYLOAD_ZOOM_IN"
 CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
 CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
+CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
 
 GREMSY_FRAME_W = 1920
 GREMSY_FRAME_H = 1080
@@ -75,9 +101,79 @@ DEFAULT_ARDUPILOT_ENDPOINT = os.environ.get(
     "udpin:0.0.0.0:14555",
 )
 
+EARTH_RADIUS_M = 6378137.0
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _wrap_360(angle_deg: float) -> float:
+    return angle_deg % 360.0
+
+
+def _matmul3(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]):
+    return [
+        [
+            sum(a[i][k] * b[k][j] for k in range(3))
+            for j in range(3)
+        ]
+        for i in range(3)
+    ]
+
+
+def _matvec3(m: Sequence[Sequence[float]], v: Sequence[float]):
+    return [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+
+
+def _euler_frd_to_ned(
+    roll_deg: float,
+    pitch_deg: float,
+    yaw_deg: float,
+):
+    """
+    Direction-cosine matrix for an FRD frame into NED.
+
+    Aerospace Z-Y-X convention:
+        R = Rz(yaw) * Ry(pitch) * Rx(roll)
+
+    x = forward / north at zero attitude
+    y = right   / east
+    z = down
+    """
+    r = math.radians(roll_deg)
+    p = math.radians(pitch_deg)
+    y = math.radians(yaw_deg)
+
+    cr, sr = math.cos(r), math.sin(r)
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+
+    rx = [
+        [1.0, 0.0, 0.0],
+        [0.0, cr, -sr],
+        [0.0, sr, cr],
+    ]
+    ry = [
+        [cp, 0.0, sp],
+        [0.0, 1.0, 0.0],
+        [-sp, 0.0, cp],
+    ]
+    rz = [
+        [cy, -sy, 0.0],
+        [sy, cy, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+
+    return _matmul3(_matmul3(rz, ry), rx)
+
 
 class RemoteExecutor:
-    """Execute remote UI commands on the local Gremsy payload SDK."""
+    """Execute UI commands and maintain target-geolocation telemetry."""
 
     def __init__(
         self,
@@ -92,7 +188,19 @@ class RemoteExecutor:
         ardupilot_sysid: int,
         ardupilot_stale_timeout: float,
         position_stale_timeout: float,
+        attitude_stale_timeout: float,
+        gimbal_stale_timeout: float,
+        track_stale_timeout: float,
         track_box: int,
+        camera_height_agl: float,
+        ground_alt_m: Optional[float],
+        min_down_angle_deg: float,
+        max_ground_range_m: float,
+        fallback_hfov_deg: float,
+        fallback_vfov_deg: float,
+        camera_roll_offset_deg: float,
+        camera_pitch_offset_deg: float,
+        camera_yaw_offset_deg: float,
     ):
         self.bridge = TcpCommandBridge(
             BridgeConfig(
@@ -111,311 +219,845 @@ class RemoteExecutor:
         self.is_connected = False
         self.payload_ip = payload_ip
 
-        # Operator mode: False = point only, True = click-to-track.
         self.track_on_click = False
-        self.track_box = max(16, min(512, int(track_box)))
-
-        # Serialize outgoing calls into the Gremsy SDK. The SDK has its own
-        # receive thread, but our command thread and ArduPilot forwarding
-        # thread can otherwise transmit at the same time.
-        self._sdk_send_lock = threading.Lock()
-
-        # ------------------------- ArduPilot state ----------------------
-        self.ardupilot_endpoint = (ardupilot_endpoint or "").strip()
-        self.ardupilot_sysid = int(ardupilot_sysid)
-        self.ardupilot_stale_timeout = max(0.5, float(ardupilot_stale_timeout))
-        self.position_stale_timeout = max(0.5, float(position_stale_timeout))
-
-        self._ap_master = None
-        self._ap_thread: Optional[threading.Thread] = None
-        self._ap_target_sysid: Optional[int] = (
-            self.ardupilot_sysid if self.ardupilot_sysid > 0 else None
+        self.track_box = max(
+            16,
+            min(512, int(track_box)),
         )
 
+        # SDK writes can come from the command thread, MAVLink forwarding
+        # thread, and FOV polling thread.
+        self._sdk_send_lock = threading.Lock()
+
+        # ------------------------- estimator config ---------------------
+        self.camera_height_agl = max(
+            0.0,
+            float(camera_height_agl),
+        )
+        self.ground_alt_m = (
+            None
+            if ground_alt_m is None
+            else float(ground_alt_m)
+        )
+        self.min_down_angle_deg = max(
+            0.1,
+            float(min_down_angle_deg),
+        )
+        self.max_ground_range_m = max(
+            1.0,
+            float(max_ground_range_m),
+        )
+
+        self.fallback_hfov_deg = max(
+            1.0,
+            min(179.0, float(fallback_hfov_deg)),
+        )
+        self.fallback_vfov_deg = max(
+            1.0,
+            min(179.0, float(fallback_vfov_deg)),
+        )
+
+        self.camera_roll_offset_deg = float(
+            camera_roll_offset_deg
+        )
+        self.camera_pitch_offset_deg = float(
+            camera_pitch_offset_deg
+        )
+        self.camera_yaw_offset_deg = float(
+            camera_yaw_offset_deg
+        )
+
+        # ------------------------- ArduPilot ----------------------------
+        self.ardupilot_endpoint = (
+            ardupilot_endpoint or ""
+        ).strip()
+        self.ardupilot_sysid = int(
+            ardupilot_sysid
+        )
+
+        self.ardupilot_stale_timeout = max(
+            0.5,
+            float(ardupilot_stale_timeout),
+        )
+        self.position_stale_timeout = max(
+            0.5,
+            float(position_stale_timeout),
+        )
+        self.attitude_stale_timeout = max(
+            0.5,
+            float(attitude_stale_timeout),
+        )
+        self.gimbal_stale_timeout = max(
+            0.5,
+            float(gimbal_stale_timeout),
+        )
+        self.track_stale_timeout = max(
+            0.5,
+            float(track_stale_timeout),
+        )
+
+        self._ap_master = None
+        self._ap_thread: Optional[
+            threading.Thread
+        ] = None
+
+        self._ap_target_sysid: Optional[int] = (
+            self.ardupilot_sysid
+            if self.ardupilot_sysid > 0
+            else None
+        )
+
+        # ------------------------- Gremsy poll --------------------------
+        self._payload_poll_thread: Optional[
+            threading.Thread
+        ] = None
+
+        # ------------------------- state --------------------------------
         self._state_lock = threading.Lock()
+
+        # ArduPilot health
         self._last_ap_heartbeat_mono = 0.0
         self._last_ap_position_mono = 0.0
-        self._last_ap_message_mono = 0.0
+        self._last_ap_attitude_mono = 0.0
         self._gps_raw_seen = False
         self._gps_fix_type = 0
-        self._last_vehicle_lat: Optional[float] = None
-        self._last_vehicle_lon: Optional[float] = None
-        self._last_vehicle_alt_m: Optional[float] = None
 
-        # Gremsy's target geolocation estimate.
-        self._target_lat: Optional[float] = None
-        self._target_lon: Optional[float] = None
-        self._target_alt: Optional[float] = None
-        self._target_update_mono = 0.0
+        # Vehicle
+        self._vehicle_lat: Optional[float] = None
+        self._vehicle_lon: Optional[float] = None
+        self._vehicle_alt_m: Optional[float] = None
+        self._vehicle_relative_alt_m: Optional[
+            float
+        ] = None
+
+        self._vehicle_roll_deg: Optional[
+            float
+        ] = None
+        self._vehicle_pitch_deg: Optional[
+            float
+        ] = None
+        self._vehicle_yaw_deg: Optional[
+            float
+        ] = None
+
+        # Gimbal attitude returned by PayloadSdk
+        self._gimbal_roll_deg: Optional[
+            float
+        ] = None
+        self._gimbal_pitch_deg: Optional[
+            float
+        ] = None
+        self._gimbal_yaw_deg: Optional[
+            float
+        ] = None
+        self._gimbal_mode = ""
+        self._gimbal_flags = 0
+        self._gimbal_frame = "unknown"
+        self._last_gimbal_mono = 0.0
+
+        # Tracker
+        self._track_status: Optional[int] = None
+        self._track_x: Optional[float] = None
+        self._track_y: Optional[float] = None
+        self._track_w: Optional[float] = None
+        self._track_h: Optional[float] = None
+        self._last_track_param_mono = 0.0
+
+        # Last acquisition click is a fallback before Gremsy starts
+        # publishing live tracker coordinates.
+        self._selected_x: Optional[float] = None
+        self._selected_y: Optional[float] = None
+        self._last_selected_mono = 0.0
+
+        # Camera FOV
+        self._hfov_deg: Optional[float] = None
+        self._vfov_deg: Optional[float] = None
+        self._last_fov_mono = 0.0
+
+        # Optional native Gremsy target output, retained for comparison.
+        self._gremsy_target_lat: Optional[
+            float
+        ] = None
+        self._gremsy_target_lon: Optional[
+            float
+        ] = None
+        self._gremsy_target_alt: Optional[
+            float
+        ] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> int:
-        """Start payload SDK, optional ArduPilot listener, and TCP bridge."""
-        ConnectionConfig.UDP_IP_TARGET = self.payload_ip
+        ConnectionConfig.UDP_IP_TARGET = (
+            self.payload_ip
+        )
+
         self.sdk = PayloadSdkInterface()
 
         if not self.sdk.sdkInitConnection():
-            self._log("payload SDK init failed")
+            self._log(
+                "payload SDK init failed"
+            )
             return 1
 
-        if not self._wait_payload_connection(timeout=8.0):
-            self._log("payload connection timeout")
+        if not self._wait_payload_connection(
+            timeout=8.0
+        ):
+            self._log(
+                "payload connection timeout"
+            )
             self.stop()
             return 1
 
-        self._configure_payload_geolocation()
+        self._configure_payload_telemetry()
+        self._start_payload_poll_worker()
         self._start_ardupilot_worker()
 
         self.bridge.start()
-        self._log("executor ready, waiting for commands")
+
+        self._log(
+            "executor ready, waiting for commands"
+        )
 
         try:
-            self.bridge.serve_commands(self._handle_command)
+            self.bridge.serve_commands(
+                self._handle_command
+            )
         except KeyboardInterrupt:
-            self._log("executor interrupted")
+            self._log(
+                "executor interrupted"
+            )
         finally:
             self.stop()
 
         return 0
 
     def stop(self) -> None:
-        """Stop executor and all background connections."""
         if not self.running:
             return
 
         self.running = False
-        self.bridge.stop()
 
-        ap_master = self._ap_master
-        self._ap_master = None
-        if ap_master is not None:
+        if self.sdk and self.is_connected:
             try:
-                ap_master.close()
+                with self._sdk_send_lock:
+                    self.sdk.setCameraZoom(
+                        mavutil.mavlink.ZOOM_TYPE_CONTINUOUS,
+                        camera_zoom_value.ZOOM_STOP,
+                    )
             except Exception:
                 pass
 
-        if self._ap_thread and self._ap_thread.is_alive():
-            self._ap_thread.join(timeout=2.0)
-        self._ap_thread = None
+        self.bridge.stop()
+
+        master = self._ap_master
+        self._ap_master = None
+
+        if master is not None:
+            try:
+                master.close()
+            except Exception:
+                pass
+
+        if (
+            self._ap_thread
+            and self._ap_thread.is_alive()
+        ):
+            self._ap_thread.join(
+                timeout=2.0
+            )
+
+        if (
+            self._payload_poll_thread
+            and self._payload_poll_thread.is_alive()
+        ):
+            self._payload_poll_thread.join(
+                timeout=2.0
+            )
 
         if self.sdk:
             try:
-                if self.is_connected:
-                    try:
-                        with self._sdk_send_lock:
-                            self.sdk.setCameraZoom(
-                                mavutil.mavlink.ZOOM_TYPE_CONTINUOUS,
-                                camera_zoom_value.ZOOM_STOP,
-                            )
-                    except Exception as exc:
-                        self._log(
-                            f"failed stopping zoom during shutdown: {exc}"
-                        )
-
                 self.sdk.sdkQuit()
             finally:
                 self.sdk = None
 
+        self.is_connected = False
+
         self._log("executor stopped")
 
-    def _wait_payload_connection(self, timeout: float) -> bool:
+    def _wait_payload_connection(
+        self,
+        timeout: float,
+    ) -> bool:
         start = time.time()
-        while self.running and (time.time() - start) < timeout:
-            if self.sdk and self.sdk.checkPayloadConnection():
+
+        while (
+            self.running
+            and time.time() - start < timeout
+        ):
+            if (
+                self.sdk
+                and self.sdk.checkPayloadConnection()
+            ):
                 self.is_connected = True
-                self._log(f"payload connected at {self.payload_ip}")
+
+                self._log(
+                    f"payload connected at "
+                    f"{self.payload_ip}"
+                )
                 return True
+
             time.sleep(0.1)
+
         return False
 
     # ------------------------------------------------------------------
-    # Gremsy geolocation output
+    # Gremsy telemetry
     # ------------------------------------------------------------------
 
-    def _configure_payload_geolocation(self) -> None:
-        """Subscribe to Gremsy's estimated target coordinates."""
+    def _configure_payload_telemetry(
+        self,
+    ) -> None:
         if self.sdk is None:
             return
 
-        self.sdk.regPayloadStatusChanged(self._on_payload_status)
+        # PAYLOAD_PARAMS + CAMERA_FOV_STATUS + MOUNT_ORIENTATION fallback.
+        self.sdk.regPayloadStatusChanged(
+            self._on_payload_status
+        )
 
-        # Gremsy API uses milliseconds for these requested parameter rates.
-        # 500 ms = 2 Hz, which is plenty for the UI display.
+        # GIMBAL_DEVICE_ATTITUDE_STATUS.
+        self.sdk.regPayloadParamChanged(
+            self._on_payload_param_changed
+        )
+
+        requested_params = [
+            payload_param_t.PARAM_TRACK_POS_X,
+            payload_param_t.PARAM_TRACK_POS_Y,
+            payload_param_t.PARAM_TRACK_POS_W,
+            payload_param_t.PARAM_TRACK_POS_H,
+            payload_param_t.PARAM_TRACK_STATUS,
+            payload_param_t.PARAM_EO_ZOOM_LEVEL,
+            # Native target location is optional and is kept only as a
+            # comparison against our own geometry-based estimator.
+            payload_param_t.PARAM_TARGET_COOR_LAT,
+            payload_param_t.PARAM_TARGET_COOR_LON,
+            payload_param_t.PARAM_TARGET_COOR_ALT,
+        ]
+
         try:
             with self._sdk_send_lock:
-                self.sdk.setParamRate(payload_param_t.PARAM_TARGET_COOR_LAT, 500)
-                self.sdk.setParamRate(payload_param_t.PARAM_TARGET_COOR_LON, 500)
-                self.sdk.setParamRate(payload_param_t.PARAM_TARGET_COOR_ALT, 500)
+                for param_index in requested_params:
+                    self.sdk.setParamRate(
+                        param_index,
+                        200,
+                    )
+
+                # Request the gimbal-device attitude at ~5 Hz.
+                if (
+                    self.sdk.master is not None
+                ):
+                    self.sdk.master.mav.command_long_send(
+                        self.sdk.gimbal_system_id,
+                        self.sdk.gimbal_component_id,
+                        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                        0,
+                        mavutil.mavlink.MAVLINK_MSG_ID_GIMBAL_DEVICE_ATTITUDE_STATUS,
+                        200000,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
         except Exception as exc:
-            self._log(f"unable to request target geolocation stream: {exc}")
+            self._log(
+                "unable to configure payload telemetry: "
+                f"{exc}"
+            )
 
-    def _on_payload_status(self, event, param: List[float]) -> None:
-        """Receive TARGET_LAT/LON/ALT updates from the Gremsy payload."""
+    def _start_payload_poll_worker(
+        self,
+    ) -> None:
+        self._payload_poll_thread = threading.Thread(
+            target=self._payload_poll_loop,
+            daemon=True,
+            name="gremsy-fov-poll",
+        )
+        self._payload_poll_thread.start()
+
+    def _payload_poll_loop(self) -> None:
+        while self.running:
+            if (
+                self.sdk is not None
+                and self.is_connected
+            ):
+                try:
+                    with self._sdk_send_lock:
+                        self.sdk.getPayloadCameraFOVStatus(
+                            camera_type_t.CAMERA_EO
+                        )
+                except Exception as exc:
+                    self._log(
+                        f"FOV request failed: {exc}"
+                    )
+
+            time.sleep(1.0)
+
+    def _on_payload_status(
+        self,
+        event,
+        param: List[float],
+    ) -> None:
         try:
-            if int(event) != int(payload_status_event_t.PAYLOAD_PARAMS):
-                return
-            if len(param) < 2:
-                return
-
-            index = int(param[0])
-            value = float(param[1])
-            if not math.isfinite(value):
-                return
-
+            event_value = int(event)
             now = time.monotonic()
 
-            with self._state_lock:
-                if index == int(payload_param_t.PARAM_TARGET_COOR_LAT):
-                    self._target_lat = value
-                    self._target_update_mono = now
-                elif index == int(payload_param_t.PARAM_TARGET_COOR_LON):
-                    self._target_lon = value
-                    self._target_update_mono = now
-                elif index == int(payload_param_t.PARAM_TARGET_COOR_ALT):
-                    self._target_alt = value
-                    self._target_update_mono = now
+            if (
+                event_value
+                == int(
+                    payload_status_event_t.PAYLOAD_PARAMS
+                )
+            ):
+                if len(param) < 2:
+                    return
+
+                index = int(param[0])
+                value = float(param[1])
+
+                if not math.isfinite(value):
+                    return
+
+                with self._state_lock:
+                    if index == int(
+                        payload_param_t.PARAM_TRACK_POS_X
+                    ):
+                        self._track_x = value
+                        self._last_track_param_mono = now
+
+                    elif index == int(
+                        payload_param_t.PARAM_TRACK_POS_Y
+                    ):
+                        self._track_y = value
+                        self._last_track_param_mono = now
+
+                    elif index == int(
+                        payload_param_t.PARAM_TRACK_POS_W
+                    ):
+                        self._track_w = value
+
+                    elif index == int(
+                        payload_param_t.PARAM_TRACK_POS_H
+                    ):
+                        self._track_h = value
+
+                    elif index == int(
+                        payload_param_t.PARAM_TRACK_STATUS
+                    ):
+                        self._track_status = int(
+                            round(value)
+                        )
+                        self._last_track_param_mono = now
+
+                    elif index == int(
+                        payload_param_t.PARAM_TARGET_COOR_LAT
+                    ):
+                        self._gremsy_target_lat = value
+
+                    elif index == int(
+                        payload_param_t.PARAM_TARGET_COOR_LON
+                    ):
+                        self._gremsy_target_lon = value
+
+                    elif index == int(
+                        payload_param_t.PARAM_TARGET_COOR_ALT
+                    ):
+                        self._gremsy_target_alt = value
+
+                return
+
+            if (
+                event_value
+                == int(
+                    payload_status_event_t.PAYLOAD_PARAM_CAM_FOV_STATUS
+                )
+            ):
+                # PayloadSdk supplies [camera_id, hfov, vfov].
+                if len(param) < 3:
+                    return
+
+                hfov = float(param[1])
+                vfov = float(param[2])
+
+                if (
+                    0.1 < hfov < 179.0
+                    and 0.1 < vfov < 179.0
+                ):
+                    with self._state_lock:
+                        self._hfov_deg = hfov
+                        self._vfov_deg = vfov
+                        self._last_fov_mono = now
+                return
+
+            # MOUNT_ORIENTATION fallback. PayloadSdk supplies:
+            # [pitch, roll, yaw]
+            if (
+                event_value
+                == int(
+                    payload_status_event_t.PAYLOAD_GB_ATTITUDE
+                )
+                and len(param) >= 3
+            ):
+                pitch = float(param[0])
+                roll = float(param[1])
+                yaw = float(param[2])
+
+                with self._state_lock:
+                    # Do not overwrite a fresh GIMBAL_DEVICE attitude.
+                    if (
+                        now
+                        - self._last_gimbal_mono
+                        > 0.75
+                    ):
+                        self._gimbal_pitch_deg = pitch
+                        self._gimbal_roll_deg = roll
+                        self._gimbal_yaw_deg = yaw
+                        self._gimbal_mode = (
+                            "MOUNT_ORIENTATION"
+                        )
+                        self._gimbal_frame = (
+                            "vehicle"
+                        )
+                        self._gimbal_flags = 0
+                        self._last_gimbal_mono = now
+
         except Exception as exc:
-            self._log(f"payload status callback error: {exc}")
+            self._log(
+                f"payload status callback error: {exc}"
+            )
+
+    def _on_payload_param_changed(
+        self,
+        event,
+        param_mode: str,
+        params: List[float],
+    ) -> None:
+        try:
+            if (
+                int(event)
+                != int(
+                    payload_status_event_t.PAYLOAD_GB_ATTITUDE
+                )
+            ):
+                return
+
+            if len(params) < 3:
+                return
+
+            # PayloadSdk ordering:
+            # [pitch_deg, roll_deg, yaw_deg, wx, wy, wz]
+            pitch = float(params[0])
+            roll = float(params[1])
+            yaw = float(params[2])
+
+            flags = 0
+
+            if self.sdk is not None:
+                flags = int(
+                    getattr(
+                        self.sdk,
+                        "current_attitude_flags",
+                        0,
+                    )
+                    or 0
+                )
+
+            yaw_in_earth = bool(
+                flags
+                & getattr(
+                    mavutil.mavlink,
+                    "GIMBAL_DEVICE_FLAGS_YAW_IN_EARTH_FRAME",
+                    64,
+                )
+            )
+            yaw_in_vehicle = bool(
+                flags
+                & getattr(
+                    mavutil.mavlink,
+                    "GIMBAL_DEVICE_FLAGS_YAW_IN_VEHICLE_FRAME",
+                    32,
+                )
+            )
+            yaw_lock = bool(
+                flags
+                & mavutil.mavlink.GIMBAL_DEVICE_FLAGS_YAW_LOCK
+            )
+
+            if yaw_in_earth or (
+                not yaw_in_vehicle
+                and yaw_lock
+            ):
+                frame = "earth"
+            else:
+                frame = "vehicle"
+
+            with self._state_lock:
+                self._gimbal_pitch_deg = pitch
+                self._gimbal_roll_deg = roll
+                self._gimbal_yaw_deg = yaw
+                self._gimbal_mode = str(
+                    param_mode or ""
+                )
+                self._gimbal_flags = flags
+                self._gimbal_frame = frame
+                self._last_gimbal_mono = (
+                    time.monotonic()
+                )
+
+        except Exception as exc:
+            self._log(
+                f"gimbal attitude callback error: {exc}"
+            )
 
     # ------------------------------------------------------------------
-    # ArduPilot MAVLink input
+    # ArduPilot
     # ------------------------------------------------------------------
 
-    def _start_ardupilot_worker(self) -> None:
-        if not self.ardupilot_endpoint or self.ardupilot_endpoint.lower() in {
-            "none",
-            "off",
-            "disabled",
-        }:
-            self._log("ArduPilot geolocation input disabled")
+    def _start_ardupilot_worker(
+        self,
+    ) -> None:
+        if (
+            not self.ardupilot_endpoint
+            or self.ardupilot_endpoint.lower()
+            in {"none", "off", "disabled"}
+        ):
+            self._log(
+                "ArduPilot input disabled"
+            )
             return
 
         self._ap_thread = threading.Thread(
             target=self._ardupilot_loop,
             daemon=True,
-            name="ardupilot-geolocation",
+            name="ardupilot-telemetry",
         )
         self._ap_thread.start()
 
     def _ardupilot_loop(self) -> None:
-        """
-        Continuously listen for ArduPilot MAVLink.
-
-        Failure to connect is intentionally non-fatal. The gimbal executor and
-        remote bridge remain fully operational and this loop keeps retrying so
-        geolocation can recover later.
-        """
         while self.running:
             master = None
+
             try:
                 self._log(
-                    f"opening optional ArduPilot MAVLink endpoint "
-                    f"{self.ardupilot_endpoint}"
+                    "opening optional ArduPilot MAVLink "
+                    f"endpoint {self.ardupilot_endpoint}"
                 )
 
                 master = mavutil.mavlink_connection(
                     self.ardupilot_endpoint,
                     source_system=255,
-                    source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER,
+                    source_component=(
+                        mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER
+                    ),
                     autoreconnect=True,
                 )
+
                 self._ap_master = master
 
                 while self.running:
-                    msg = master.recv_match(blocking=True, timeout=0.5)
+                    msg = master.recv_match(
+                        blocking=True,
+                        timeout=0.5,
+                    )
+
                     if msg is None:
                         continue
 
                     msg_type = msg.get_type()
+
                     if msg_type == "BAD_DATA":
                         continue
 
-                    src_sysid = int(msg.get_srcSystem())
-                    if not self._accept_ardupilot_system(msg, src_sysid):
+                    src_sysid = int(
+                        msg.get_srcSystem()
+                    )
+
+                    if not self._accept_ardupilot_system(
+                        msg,
+                        src_sysid,
+                    ):
                         continue
 
                     now = time.monotonic()
-                    with self._state_lock:
-                        self._last_ap_message_mono = now
 
                     if msg_type == "HEARTBEAT":
                         with self._state_lock:
                             self._last_ap_heartbeat_mono = now
                         continue
 
-                    if msg_type == "GPS_RAW_INT":
-                        self._handle_ardupilot_gps_raw(msg, now)
+                    if msg_type == "ATTITUDE":
+                        self._handle_ardupilot_attitude(
+                            msg,
+                            now,
+                        )
                         continue
 
-                    if msg_type == "GLOBAL_POSITION_INT":
-                        self._handle_ardupilot_global_position(msg, now)
+                    if msg_type == "GPS_RAW_INT":
+                        self._handle_ardupilot_gps_raw(
+                            msg,
+                            now,
+                        )
+                        continue
+
+                    if (
+                        msg_type
+                        == "GLOBAL_POSITION_INT"
+                    ):
+                        self._handle_ardupilot_global_position(
+                            msg,
+                            now,
+                        )
                         continue
 
             except Exception as exc:
                 if self.running:
-                    self._log(f"ArduPilot MAVLink error: {exc}")
+                    self._log(
+                        f"ArduPilot MAVLink error: {exc}"
+                    )
+
             finally:
                 if master is not None:
                     try:
                         master.close()
                     except Exception:
                         pass
+
                 if self._ap_master is master:
                     self._ap_master = None
 
             if self.running:
                 time.sleep(2.0)
 
-    def _accept_ardupilot_system(self, msg, src_sysid: int) -> bool:
-        """Select one vehicle system and ignore unrelated MAVLink systems."""
+    def _accept_ardupilot_system(
+        self,
+        msg,
+        src_sysid: int,
+    ) -> bool:
         if self.ardupilot_sysid > 0:
-            return src_sysid == self.ardupilot_sysid
+            return (
+                src_sysid
+                == self.ardupilot_sysid
+            )
 
         if self._ap_target_sysid is not None:
-            return src_sysid == self._ap_target_sysid
+            return (
+                src_sysid
+                == self._ap_target_sysid
+            )
 
         if msg.get_type() == "HEARTBEAT":
             autopilot = int(
-                getattr(msg, "autopilot", mavutil.mavlink.MAV_AUTOPILOT_INVALID)
+                getattr(
+                    msg,
+                    "autopilot",
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                )
             )
-            src_component = int(msg.get_srcComponent())
+
+            component = int(
+                msg.get_srcComponent()
+            )
 
             if (
-                autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
-                or src_component == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+                autopilot
+                != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+                or component
+                == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
             ):
-                self._ap_target_sysid = src_sysid
-                self._log(f"selected ArduPilot MAVLink sysid={src_sysid}")
+                self._ap_target_sysid = (
+                    src_sysid
+                )
+
+                self._log(
+                    "selected ArduPilot MAVLink "
+                    f"sysid={src_sysid}"
+                )
                 return True
 
-        # GLOBAL_POSITION_INT can be useful even if the heartbeat was lost.
-        # Wait for a heartbeat before locking onto an unknown system so that
-        # another MAVLink component is not accidentally selected.
         return False
 
-    def _handle_ardupilot_global_position(self, msg, now: float) -> None:
-        lat_deg = float(msg.lat) / 1.0e7
-        lon_deg = float(msg.lon) / 1.0e7
-        alt_m = float(msg.alt) / 1000.0
+    def _handle_ardupilot_attitude(
+        self,
+        msg,
+        now: float,
+    ) -> None:
+        with self._state_lock:
+            self._vehicle_roll_deg = (
+                math.degrees(
+                    float(msg.roll)
+                )
+            )
+            self._vehicle_pitch_deg = (
+                math.degrees(
+                    float(msg.pitch)
+                )
+            )
+            self._vehicle_yaw_deg = (
+                _wrap_360(
+                    math.degrees(
+                        float(msg.yaw)
+                    )
+                )
+            )
+            self._last_ap_attitude_mono = now
+
+    def _handle_ardupilot_global_position(
+        self,
+        msg,
+        now: float,
+    ) -> None:
+        lat_deg = (
+            float(msg.lat) / 1.0e7
+        )
+        lon_deg = (
+            float(msg.lon) / 1.0e7
+        )
+        alt_m = (
+            float(msg.alt) / 1000.0
+        )
+        relative_alt_m = (
+            float(msg.relative_alt)
+            / 1000.0
+        )
 
         with self._state_lock:
             self._last_ap_position_mono = now
-            self._last_vehicle_lat = lat_deg
-            self._last_vehicle_lon = lon_deg
-            self._last_vehicle_alt_m = alt_m
+            self._vehicle_lat = lat_deg
+            self._vehicle_lon = lon_deg
+            self._vehicle_alt_m = alt_m
+            self._vehicle_relative_alt_m = (
+                relative_alt_m
+            )
 
-        if self.sdk is None or not self.is_connected:
+        # Forward the vehicle position to Gremsy as well.
+        if (
+            self.sdk is None
+            or not self.is_connected
+        ):
             return
 
         gps = mavlink_global_position_int_t()
-        gps.time_boot_ms = int(msg.time_boot_ms)
+        gps.time_boot_ms = int(
+            msg.time_boot_ms
+        )
         gps.lat = int(msg.lat)
         gps.lon = int(msg.lon)
         gps.alt = int(msg.alt)
-        gps.relative_alt = int(msg.relative_alt)
+        gps.relative_alt = int(
+            msg.relative_alt
+        )
         gps.vx = int(msg.vx)
         gps.vy = int(msg.vy)
         gps.vz = int(msg.vz)
@@ -423,177 +1065,925 @@ class RemoteExecutor:
 
         try:
             with self._sdk_send_lock:
-                self.sdk.sendPayloadGPSPosition(gps)
+                self.sdk.sendPayloadGPSPosition(
+                    gps
+                )
         except Exception as exc:
-            self._log(f"failed forwarding GLOBAL_POSITION_INT to payload: {exc}")
+            self._log(
+                "failed forwarding "
+                f"GLOBAL_POSITION_INT: {exc}"
+            )
 
-    def _handle_ardupilot_gps_raw(self, msg, now: float) -> None:
-        fix_type = int(getattr(msg, "fix_type", 0))
+    def _handle_ardupilot_gps_raw(
+        self,
+        msg,
+        now: float,
+    ) -> None:
+        fix_type = int(
+            getattr(
+                msg,
+                "fix_type",
+                0,
+            )
+        )
 
         with self._state_lock:
             self._gps_raw_seen = True
             self._gps_fix_type = fix_type
 
-        if self.sdk is None or not self.is_connected:
+        if (
+            self.sdk is None
+            or not self.is_connected
+        ):
             return
 
         gps = mavlink_gps_raw_int_t()
-        gps.time_usec = int(getattr(msg, "time_usec", 0))
-        gps.lat = int(getattr(msg, "lat", 0))
-        gps.lon = int(getattr(msg, "lon", 0))
-        gps.alt = int(getattr(msg, "alt", 0))
-        gps.eph = int(getattr(msg, "eph", 65535))
-        gps.epv = int(getattr(msg, "epv", 65535))
-        gps.vel = int(getattr(msg, "vel", 65535))
-        gps.cog = int(getattr(msg, "cog", 65535))
+        gps.time_usec = int(
+            getattr(msg, "time_usec", 0)
+        )
+        gps.lat = int(
+            getattr(msg, "lat", 0)
+        )
+        gps.lon = int(
+            getattr(msg, "lon", 0)
+        )
+        gps.alt = int(
+            getattr(msg, "alt", 0)
+        )
+        gps.eph = int(
+            getattr(msg, "eph", 65535)
+        )
+        gps.epv = int(
+            getattr(msg, "epv", 65535)
+        )
+        gps.vel = int(
+            getattr(msg, "vel", 65535)
+        )
+        gps.cog = int(
+            getattr(msg, "cog", 65535)
+        )
         gps.fix_type = fix_type
-        gps.satellites_visible = int(getattr(msg, "satellites_visible", 255))
-        gps.alt_ellipsoid = int(getattr(msg, "alt_ellipsoid", 0))
-        gps.h_acc = int(getattr(msg, "h_acc", 0))
-        gps.v_acc = int(getattr(msg, "v_acc", 0))
-        gps.vel_acc = int(getattr(msg, "vel_acc", 0))
-        gps.hdg_acc = int(getattr(msg, "hdg_acc", 0))
-        gps.yaw = int(getattr(msg, "yaw", 0))
+        gps.satellites_visible = int(
+            getattr(
+                msg,
+                "satellites_visible",
+                255,
+            )
+        )
+        gps.alt_ellipsoid = int(
+            getattr(
+                msg,
+                "alt_ellipsoid",
+                0,
+            )
+        )
+        gps.h_acc = int(
+            getattr(msg, "h_acc", 0)
+        )
+        gps.v_acc = int(
+            getattr(msg, "v_acc", 0)
+        )
+        gps.vel_acc = int(
+            getattr(msg, "vel_acc", 0)
+        )
+        gps.hdg_acc = int(
+            getattr(msg, "hdg_acc", 0)
+        )
+        gps.yaw = int(
+            getattr(msg, "yaw", 0)
+        )
 
         try:
             with self._sdk_send_lock:
-                self.sdk.sendPayloadGPSRawInt(gps)
+                self.sdk.sendPayloadGPSRawInt(
+                    gps
+                )
         except Exception as exc:
-            self._log(f"failed forwarding GPS_RAW_INT to payload: {exc}")
+            self._log(
+                "failed forwarding "
+                f"GPS_RAW_INT: {exc}"
+            )
 
     # ------------------------------------------------------------------
-    # Status snapshot requested by UI
+    # Target geolocation
     # ------------------------------------------------------------------
 
-    def _geo_status(self) -> Dict:
+    def _resolve_camera_attitude_ned(
+        self,
+        vehicle_roll: float,
+        vehicle_pitch: float,
+        vehicle_yaw: float,
+        gimbal_roll: float,
+        gimbal_pitch: float,
+        gimbal_yaw: float,
+        gimbal_flags: int,
+        gimbal_frame: str,
+    ) -> Tuple[float, float, float, str]:
+        """
+        Convert the available attitude information into an approximate
+        earth/NED camera attitude.
+
+        MAVLink's GIMBAL_DEVICE_ATTITUDE_STATUS can report yaw in either
+        the earth or vehicle-heading frame. Roll/pitch lock flags also tell
+        whether those axes are horizon-locked.
+
+        This resolves each axis conservatively:
+        - locked axis -> treat gimbal angle as earth referenced
+        - unlocked axis -> add vehicle attitude
+        """
+        roll_lock = bool(
+            gimbal_flags
+            & getattr(
+                mavutil.mavlink,
+                "GIMBAL_DEVICE_FLAGS_ROLL_LOCK",
+                4,
+            )
+        )
+        pitch_lock = bool(
+            gimbal_flags
+            & getattr(
+                mavutil.mavlink,
+                "GIMBAL_DEVICE_FLAGS_PITCH_LOCK",
+                8,
+            )
+        )
+
+        if roll_lock:
+            roll_abs = gimbal_roll
+        else:
+            roll_abs = (
+                vehicle_roll
+                + gimbal_roll
+            )
+
+        if pitch_lock:
+            pitch_abs = gimbal_pitch
+        else:
+            pitch_abs = (
+                vehicle_pitch
+                + gimbal_pitch
+            )
+
+        if gimbal_frame == "earth":
+            yaw_abs = gimbal_yaw
+            frame_note = "gimbal yaw earth"
+        else:
+            yaw_abs = (
+                vehicle_yaw
+                + gimbal_yaw
+            )
+            frame_note = "gimbal yaw vehicle"
+
+        roll_abs += self.camera_roll_offset_deg
+        pitch_abs += self.camera_pitch_offset_deg
+        yaw_abs += self.camera_yaw_offset_deg
+
+        return (
+            roll_abs,
+            pitch_abs,
+            _wrap_360(yaw_abs),
+            frame_note,
+        )
+
+    def _get_height_agl(
+        self,
+        vehicle_alt_m: Optional[float],
+        relative_alt_m: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float], str]:
+        """
+        Return:
+            height_agl_m,
+            estimated_ground_alt_m,
+            source
+        """
+        if (
+            self.ground_alt_m is not None
+            and vehicle_alt_m is not None
+        ):
+            height = (
+                vehicle_alt_m
+                - self.ground_alt_m
+            )
+
+            if height > 0.05:
+                return (
+                    height,
+                    self.ground_alt_m,
+                    "ground-alt",
+                )
+
+        if self.camera_height_agl > 0.05:
+            ground_alt = (
+                None
+                if vehicle_alt_m is None
+                else vehicle_alt_m
+                - self.camera_height_agl
+            )
+
+            return (
+                self.camera_height_agl,
+                ground_alt,
+                "camera-height-agl",
+            )
+
+        if (
+            relative_alt_m is not None
+            and relative_alt_m > 0.05
+        ):
+            ground_alt = (
+                None
+                if vehicle_alt_m is None
+                else vehicle_alt_m
+                - relative_alt_m
+            )
+
+            return (
+                relative_alt_m,
+                ground_alt,
+                "relative-alt",
+            )
+
+        return (
+            None,
+            None,
+            "none",
+        )
+
+    def _choose_tracking_pixel(
+        self,
+        now: float,
+        track_x: Optional[float],
+        track_y: Optional[float],
+        track_update: float,
+        selected_x: Optional[float],
+        selected_y: Optional[float],
+        selected_update: float,
+    ) -> Tuple[Optional[float], Optional[float], str]:
+        # Best source: live tracker output.
+        if (
+            track_x is not None
+            and track_y is not None
+            and track_update > 0.0
+            and now - track_update
+            <= self.track_stale_timeout
+        ):
+            return (
+                _clamp(
+                    track_x,
+                    0.0,
+                    GREMSY_FRAME_W - 1.0,
+                ),
+                _clamp(
+                    track_y,
+                    0.0,
+                    GREMSY_FRAME_H - 1.0,
+                ),
+                "gremsy-track",
+            )
+
+        # Immediately after acquisition, use the selected pixel.
+        if (
+            selected_x is not None
+            and selected_y is not None
+            and selected_update > 0.0
+            and now - selected_update < 1.5
+        ):
+            return (
+                selected_x,
+                selected_y,
+                "selected-pixel",
+            )
+
+        # If tracking is still enabled, Gremsy's job is to keep the tracked
+        # object near image center. This is a more useful fallback than
+        # retaining the original off-center click indefinitely.
+        if self.track_on_click:
+            return (
+                GREMSY_FRAME_W / 2.0,
+                GREMSY_FRAME_H / 2.0,
+                "assumed-image-center",
+            )
+
+        return None, None, "none"
+
+    def _estimate_target_location(
+        self,
+    ) -> Dict:
         now = time.monotonic()
 
         with self._state_lock:
             hb_time = self._last_ap_heartbeat_mono
             pos_time = self._last_ap_position_mono
+            att_time = self._last_ap_attitude_mono
+
             gps_raw_seen = self._gps_raw_seen
             fix_type = self._gps_fix_type
 
-            vehicle_lat = self._last_vehicle_lat
-            vehicle_lon = self._last_vehicle_lon
-            vehicle_alt = self._last_vehicle_alt_m
+            vehicle_lat = self._vehicle_lat
+            vehicle_lon = self._vehicle_lon
+            vehicle_alt_m = self._vehicle_alt_m
+            relative_alt_m = (
+                self._vehicle_relative_alt_m
+            )
 
-            target_lat = self._target_lat
-            target_lon = self._target_lon
-            target_alt = self._target_alt
-            target_update = self._target_update_mono
+            vehicle_roll = self._vehicle_roll_deg
+            vehicle_pitch = (
+                self._vehicle_pitch_deg
+            )
+            vehicle_yaw = self._vehicle_yaw_deg
 
-        heartbeat_age = None if hb_time <= 0.0 else max(0.0, now - hb_time)
-        position_age = None if pos_time <= 0.0 else max(0.0, now - pos_time)
-        target_age = None if target_update <= 0.0 else max(0.0, now - target_update)
+            gimbal_roll = self._gimbal_roll_deg
+            gimbal_pitch = self._gimbal_pitch_deg
+            gimbal_yaw = self._gimbal_yaw_deg
+            gimbal_mode = self._gimbal_mode
+            gimbal_flags = self._gimbal_flags
+            gimbal_frame = self._gimbal_frame
+            gimbal_time = self._last_gimbal_mono
+
+            track_status = self._track_status
+            track_x = self._track_x
+            track_y = self._track_y
+            track_w = self._track_w
+            track_h = self._track_h
+            track_update = (
+                self._last_track_param_mono
+            )
+
+            selected_x = self._selected_x
+            selected_y = self._selected_y
+            selected_update = (
+                self._last_selected_mono
+            )
+
+            hfov = self._hfov_deg
+            vfov = self._vfov_deg
+            fov_time = self._last_fov_mono
+
+            gremsy_target_lat = (
+                self._gremsy_target_lat
+            )
+            gremsy_target_lon = (
+                self._gremsy_target_lon
+            )
+            gremsy_target_alt = (
+                self._gremsy_target_alt
+            )
+
+        heartbeat_age = (
+            None
+            if hb_time <= 0.0
+            else max(0.0, now - hb_time)
+        )
+        position_age = (
+            None
+            if pos_time <= 0.0
+            else max(0.0, now - pos_time)
+        )
+        attitude_age = (
+            None
+            if att_time <= 0.0
+            else max(0.0, now - att_time)
+        )
+        gimbal_age = (
+            None
+            if gimbal_time <= 0.0
+            else max(0.0, now - gimbal_time)
+        )
 
         ardupilot_connected = (
             heartbeat_age is not None
-            and heartbeat_age <= self.ardupilot_stale_timeout
+            and heartbeat_age
+            <= self.ardupilot_stale_timeout
         )
 
         position_fresh = (
             position_age is not None
-            and position_age <= self.position_stale_timeout
+            and position_age
+            <= self.position_stale_timeout
         )
 
-        # If GPS_RAW_INT is present, use its actual fix type. If the stream
-        # doesn't include GPS_RAW_INT, a fresh non-zero GLOBAL_POSITION_INT is
-        # accepted as the fallback indication that vehicle position is usable.
+        attitude_fresh = (
+            attitude_age is not None
+            and attitude_age
+            <= self.attitude_stale_timeout
+        )
+
+        gimbal_fresh = (
+            gimbal_age is not None
+            and gimbal_age
+            <= self.gimbal_stale_timeout
+        )
+
         if gps_raw_seen:
-            gps_valid = ardupilot_connected and position_fresh and fix_type >= 3
+            gps_valid = (
+                ardupilot_connected
+                and position_fresh
+                and fix_type >= 3
+            )
         else:
             gps_valid = (
                 ardupilot_connected
                 and position_fresh
                 and vehicle_lat is not None
                 and vehicle_lon is not None
-                and not (abs(vehicle_lat) < 1e-12 and abs(vehicle_lon) < 1e-12)
+                and not (
+                    abs(vehicle_lat) < 1e-12
+                    and abs(vehicle_lon) < 1e-12
+                )
             )
 
-        geolocation_available = ardupilot_connected and gps_valid
-
-        target_valid = (
-            geolocation_available
-            and target_lat is not None
-            and target_lon is not None
-            and math.isfinite(target_lat)
-            and math.isfinite(target_lon)
-            and not (abs(target_lat) < 1e-12 and abs(target_lon) < 1e-12)
-        )
-
-        if not self.ardupilot_endpoint or self.ardupilot_endpoint.lower() in {
-            "none",
-            "off",
-            "disabled",
-        }:
-            detail = "ArduPilot input disabled"
-        elif not ardupilot_connected:
-            detail = f"Waiting for ArduPilot on {self.ardupilot_endpoint}"
-        elif not gps_valid:
-            detail = "ArduPilot connected; waiting for valid GPS position"
-        elif not target_valid:
-            detail = "Vehicle GPS available; waiting for Gremsy target location"
-        else:
-            detail = "Target geolocation available"
-
-        return {
-            "ardupilot_connected": ardupilot_connected,
-            "ardupilot_sysid": self._ap_target_sysid,
+        result = {
+            "ardupilot_connected": (
+                ardupilot_connected
+            ),
+            "ardupilot_sysid": (
+                self._ap_target_sysid
+            ),
             "gps_valid": gps_valid,
-            "gps_fix_type": fix_type if gps_raw_seen else None,
-            "geolocation_available": geolocation_available,
-            "target_valid": target_valid,
+            "gps_fix_type": (
+                fix_type
+                if gps_raw_seen
+                else None
+            ),
             "vehicle_lat": vehicle_lat,
             "vehicle_lon": vehicle_lon,
-            "vehicle_alt": vehicle_alt,
-            "target_lat": target_lat if target_valid else None,
-            "target_lon": target_lon if target_valid else None,
-            "target_alt": target_alt if target_valid else None,
+            "vehicle_alt_m": vehicle_alt_m,
+            "vehicle_relative_alt_m": (
+                relative_alt_m
+            ),
+            "vehicle_roll_deg": vehicle_roll,
+            "vehicle_pitch_deg": vehicle_pitch,
+            "vehicle_yaw_deg": vehicle_yaw,
+            "gimbal_roll_deg": gimbal_roll,
+            "gimbal_pitch_deg": gimbal_pitch,
+            "gimbal_yaw_deg": gimbal_yaw,
+            "gimbal_mode": gimbal_mode,
+            "gimbal_frame": gimbal_frame,
+            "gimbal_flags": gimbal_flags,
+            "track_enabled": self.track_on_click,
+            "track_status": track_status,
+            "track_w": track_w,
+            "track_h": track_h,
+            "hfov_deg": (
+                hfov
+                if hfov is not None
+                else self.fallback_hfov_deg
+            ),
+            "vfov_deg": (
+                vfov
+                if vfov is not None
+                else self.fallback_vfov_deg
+            ),
+            "fov_source": (
+                "gremsy"
+                if (
+                    hfov is not None
+                    and vfov is not None
+                    and fov_time > 0.0
+                )
+                else "fallback"
+            ),
+            "estimate_valid": False,
+            "estimate_reason": "",
+            "estimated_target_lat": None,
+            "estimated_target_lon": None,
+            "estimated_target_alt_m": None,
+            "ground_range_m": None,
+            "slant_range_m": None,
+            "los_azimuth_deg": None,
+            "los_down_deg": None,
+            "height_agl_m": None,
+            "height_source": "none",
+            "track_x": None,
+            "track_y": None,
+            "track_pixel_source": "none",
+            "gremsy_target_lat": gremsy_target_lat,
+            "gremsy_target_lon": gremsy_target_lon,
+            "gremsy_target_alt": gremsy_target_alt,
             "heartbeat_age_s": heartbeat_age,
             "position_age_s": position_age,
-            "target_age_s": target_age,
-            "ardupilot_endpoint": self.ardupilot_endpoint,
-            "detail": detail,
+            "attitude_age_s": attitude_age,
+            "gimbal_age_s": gimbal_age,
+            "ardupilot_endpoint": (
+                self.ardupilot_endpoint
+            ),
         }
 
+        if not ardupilot_connected:
+            result["estimate_reason"] = (
+                "Waiting for ArduPilot heartbeat"
+            )
+            return result
+
+        if not gps_valid:
+            result["estimate_reason"] = (
+                "Waiting for valid vehicle GPS"
+            )
+            return result
+
+        if not attitude_fresh:
+            result["estimate_reason"] = (
+                "Waiting for fresh vehicle ATTITUDE"
+            )
+            return result
+
+        if not gimbal_fresh:
+            result["estimate_reason"] = (
+                "Waiting for fresh Gremsy gimbal attitude"
+            )
+            return result
+
+        if not self.track_on_click:
+            result["estimate_reason"] = (
+                "Tracking not enabled"
+            )
+            return result
+
+        # 2 means TRACK_LOST in the PayloadSdk.
+        if track_status == 2:
+            result["estimate_reason"] = (
+                "Gremsy tracker reports LOST"
+            )
+            return result
+
+        pixel_x, pixel_y, pixel_source = (
+            self._choose_tracking_pixel(
+                now,
+                track_x,
+                track_y,
+                track_update,
+                selected_x,
+                selected_y,
+                selected_update,
+            )
+        )
+
+        result["track_x"] = pixel_x
+        result["track_y"] = pixel_y
+        result["track_pixel_source"] = (
+            pixel_source
+        )
+
+        if pixel_x is None or pixel_y is None:
+            result["estimate_reason"] = (
+                "No tracked/selected image point"
+            )
+            return result
+
+        required_values = [
+            vehicle_lat,
+            vehicle_lon,
+            vehicle_roll,
+            vehicle_pitch,
+            vehicle_yaw,
+            gimbal_roll,
+            gimbal_pitch,
+            gimbal_yaw,
+        ]
+
+        if any(
+            value is None
+            for value in required_values
+        ):
+            result["estimate_reason"] = (
+                "Incomplete attitude/GPS state"
+            )
+            return result
+
+        height_agl, estimated_ground_alt, height_source = (
+            self._get_height_agl(
+                vehicle_alt_m,
+                relative_alt_m,
+            )
+        )
+
+        result["height_agl_m"] = height_agl
+        result["height_source"] = (
+            height_source
+        )
+
+        if height_agl is None:
+            result["estimate_reason"] = (
+                "No usable camera AGL. "
+                "For ground tests run executor with "
+                "--camera-height-agl <meters>."
+            )
+            return result
+
+        # Resolve the center optical-axis attitude.
+        (
+            camera_roll,
+            camera_pitch,
+            camera_yaw,
+            frame_note,
+        ) = self._resolve_camera_attitude_ned(
+            float(vehicle_roll),
+            float(vehicle_pitch),
+            float(vehicle_yaw),
+            float(gimbal_roll),
+            float(gimbal_pitch),
+            float(gimbal_yaw),
+            int(gimbal_flags),
+            str(gimbal_frame),
+        )
+
+        # FOV supplied by Gremsy is preferred because it changes with zoom.
+        hfov_used = (
+            float(hfov)
+            if hfov is not None
+            and 0.1 < hfov < 179.0
+            else self.fallback_hfov_deg
+        )
+        vfov_used = (
+            float(vfov)
+            if vfov is not None
+            and 0.1 < vfov < 179.0
+            else self.fallback_vfov_deg
+        )
+
+        # Camera frame is FRD:
+        #   +X optical axis
+        #   +Y image right
+        #   +Z image down
+        cx = GREMSY_FRAME_W / 2.0
+        cy = GREMSY_FRAME_H / 2.0
+
+        fx = (
+            GREMSY_FRAME_W / 2.0
+        ) / math.tan(
+            math.radians(
+                hfov_used / 2.0
+            )
+        )
+        fy = (
+            GREMSY_FRAME_H / 2.0
+        ) / math.tan(
+            math.radians(
+                vfov_used / 2.0
+            )
+        )
+
+        ray_camera = [
+            1.0,
+            (float(pixel_x) - cx) / fx,
+            (float(pixel_y) - cy) / fy,
+        ]
+
+        norm = math.sqrt(
+            sum(
+                component * component
+                for component in ray_camera
+            )
+        )
+        ray_camera = [
+            component / norm
+            for component in ray_camera
+        ]
+
+        camera_dcm = _euler_frd_to_ned(
+            camera_roll,
+            camera_pitch,
+            camera_yaw,
+        )
+
+        ray_ned = _matvec3(
+            camera_dcm,
+            ray_camera,
+        )
+
+        horizontal_component = math.hypot(
+            ray_ned[0],
+            ray_ned[1],
+        )
+
+        los_down_deg = math.degrees(
+            math.atan2(
+                ray_ned[2],
+                horizontal_component,
+            )
+        )
+
+        los_azimuth_deg = _wrap_360(
+            math.degrees(
+                math.atan2(
+                    ray_ned[1],
+                    ray_ned[0],
+                )
+            )
+        )
+
+        result["los_down_deg"] = (
+            los_down_deg
+        )
+        result["los_azimuth_deg"] = (
+            los_azimuth_deg
+        )
+        result["camera_roll_ned_deg"] = (
+            camera_roll
+        )
+        result["camera_pitch_ned_deg"] = (
+            camera_pitch
+        )
+        result["camera_yaw_ned_deg"] = (
+            camera_yaw
+        )
+        result["camera_frame_note"] = (
+            frame_note
+        )
+
+        if (
+            ray_ned[2] <= 0.0
+            or los_down_deg
+            < self.min_down_angle_deg
+        ):
+            result["estimate_reason"] = (
+                "LOS too close to horizon or points above ground "
+                f"(down angle={los_down_deg:.2f} deg)"
+            )
+            return result
+
+        # Camera is h meters above the ground plane in NED, so its z
+        # coordinate is -h. Ground is z=0.
+        scale = (
+            height_agl / ray_ned[2]
+        )
+
+        north_m = scale * ray_ned[0]
+        east_m = scale * ray_ned[1]
+        ground_range_m = math.hypot(
+            north_m,
+            east_m,
+        )
+        slant_range_m = scale
+
+        if (
+            ground_range_m
+            > self.max_ground_range_m
+        ):
+            result["estimate_reason"] = (
+                "Estimated range exceeds configured limit "
+                f"({ground_range_m:.1f} m)"
+            )
+            return result
+
+        lat_rad = math.radians(
+            float(vehicle_lat)
+        )
+
+        estimated_lat = (
+            float(vehicle_lat)
+            + math.degrees(
+                north_m / EARTH_RADIUS_M
+            )
+        )
+
+        cos_lat = math.cos(lat_rad)
+
+        if abs(cos_lat) < 1e-9:
+            result["estimate_reason"] = (
+                "Longitude conversion invalid near pole"
+            )
+            return result
+
+        estimated_lon = (
+            float(vehicle_lon)
+            + math.degrees(
+                east_m
+                / (
+                    EARTH_RADIUS_M
+                    * cos_lat
+                )
+            )
+        )
+
+        result.update(
+            {
+                "estimate_valid": True,
+                "estimate_reason": (
+                    "Flat-ground LOS intersection"
+                ),
+                "estimated_target_lat": (
+                    estimated_lat
+                ),
+                "estimated_target_lon": (
+                    estimated_lon
+                ),
+                "estimated_target_alt_m": (
+                    estimated_ground_alt
+                ),
+                "ground_range_m": (
+                    ground_range_m
+                ),
+                "slant_range_m": (
+                    slant_range_m
+                ),
+                "north_offset_m": (
+                    north_m
+                ),
+                "east_offset_m": (
+                    east_m
+                ),
+            }
+        )
+
+        return result
+
     # ------------------------------------------------------------------
-    # Remote UI commands
+    # Remote commands
     # ------------------------------------------------------------------
 
-    def _handle_command(self, command: str, params: List) -> Tuple[bool, str]:
-        # Status must remain queryable independently of tracking state.
+    def _handle_command(
+        self,
+        command: str,
+        params: List,
+    ) -> Tuple[bool, str]:
+        # Status must remain queryable even while target solution is invalid.
         if command == CMD_GET_GEO_STATUS:
-            return True, json.dumps(self._geo_status(), separators=(",", ":"))
+            return (
+                True,
+                json.dumps(
+                    self._estimate_target_location(),
+                    separators=(",", ":"),
+                ),
+            )
 
-        if not self.sdk or not self.is_connected:
-            return False, "payload not connected"
+        if (
+            not self.sdk
+            or not self.is_connected
+        ):
+            return (
+                False,
+                "payload not connected",
+            )
 
         try:
             if command == CMD_PAYLOAD_TRACK:
-                enable = bool(int(params[0])) if params else False
+                enable = (
+                    bool(int(params[0]))
+                    if params
+                    else False
+                )
+
                 self.track_on_click = enable
 
-                # Turning tracking off immediately stops an existing track.
-                # Turning it on only arms the UI mode; TRACK_ACTIVE is sent on
-                # the next click so the selected image point is the trigger.
                 if not enable:
                     with self._sdk_send_lock:
                         self.sdk.setPayloadObjectTrackingMode(
                             tracking_mode_t.TRACK_STOP
                         )
-                    return True, "tracking disabled; click mode is point camera"
 
-                return True, "tracking enabled; click a target to acquire"
+                    with self._state_lock:
+                        self._selected_x = None
+                        self._selected_y = None
+                        self._last_selected_mono = 0.0
+
+                    return (
+                        True,
+                        "tracking disabled; "
+                        "click mode is point camera",
+                    )
+
+                return (
+                    True,
+                    "tracking enabled; "
+                    "click a target to acquire",
+                )
 
             if command == CMD_PAYLOAD_TOUCH:
-                x = int(params[0]) if len(params) > 0 else GREMSY_FRAME_W // 2
-                y = int(params[1]) if len(params) > 1 else GREMSY_FRAME_H // 2
+                x = (
+                    int(params[0])
+                    if len(params) > 0
+                    else GREMSY_FRAME_W // 2
+                )
+                y = (
+                    int(params[1])
+                    if len(params) > 1
+                    else GREMSY_FRAME_H // 2
+                )
 
-                x = max(0, min(GREMSY_FRAME_W - 1, x))
-                y = max(0, min(GREMSY_FRAME_H - 1, y))
+                x = max(
+                    0,
+                    min(
+                        GREMSY_FRAME_W - 1,
+                        x,
+                    ),
+                )
+                y = max(
+                    0,
+                    min(
+                        GREMSY_FRAME_H - 1,
+                        y,
+                    ),
+                )
 
                 if self.track_on_click:
+                    with self._state_lock:
+                        self._selected_x = float(x)
+                        self._selected_y = float(y)
+                        self._last_selected_mono = (
+                            time.monotonic()
+                        )
+
                     with self._sdk_send_lock:
                         self.sdk.setPayloadObjectTrackingMode(
                             tracking_mode_t.TRACK_ACTIVE
@@ -605,13 +1995,13 @@ class RemoteExecutor:
                             self.track_box,
                         )
 
-                    return True, (
-                        f"tracking acquisition sent x={x} y={y} "
-                        f"box={self.track_box}x{self.track_box}"
+                    return (
+                        True,
+                        f"tracking acquisition sent "
+                        f"x={x} y={y} "
+                        f"box={self.track_box}x{self.track_box}",
                     )
 
-                # EagleEyes: move gimbal to the selected image point without
-                # triggering object tracking.
                 with self._sdk_send_lock:
                     self.sdk.setPayloadObjectTrackingMode(
                         tracking_mode_t.TRACK_EAGLEEYES
@@ -623,7 +2013,11 @@ class RemoteExecutor:
                         self.track_box,
                     )
 
-                return True, f"camera point command sent x={x} y={y}"
+                return (
+                    True,
+                    f"camera point command sent "
+                    f"x={x} y={y}",
+                )
 
             if command == CMD_PAYLOAD_ZOOM_IN:
                 with self._sdk_send_lock:
@@ -632,7 +2026,7 @@ class RemoteExecutor:
                         camera_zoom_value.ZOOM_IN,
                     )
 
-                return True, "continuous zoom in started"
+                return True, "zoom in started"
 
             if command == CMD_PAYLOAD_ZOOM_OUT:
                 with self._sdk_send_lock:
@@ -641,7 +2035,7 @@ class RemoteExecutor:
                         camera_zoom_value.ZOOM_OUT,
                     )
 
-                return True, "continuous zoom out started"
+                return True, "zoom out started"
 
             if command == CMD_PAYLOAD_ZOOM_STOP:
                 with self._sdk_send_lock:
@@ -652,20 +2046,32 @@ class RemoteExecutor:
 
                 return True, "zoom stopped"
 
-            return False, f"unsupported command: {command}"
+            return (
+                False,
+                f"unsupported command: {command}",
+            )
 
         except Exception as exc:
-            return False, f"execution error: {exc}"
+            return (
+                False,
+                f"execution error: {exc}",
+            )
 
     @staticmethod
     def _log(message: str) -> None:
-        print(f"[REMOTE_EXECUTOR] {message}")
+        print(
+            f"[REMOTE_EXECUTOR] {message}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Payload SDK Remote Executor"
+        description=(
+            "Gremsy Payload SDK Remote Executor "
+            "with target geolocation estimator"
+        )
     )
+
     parser.add_argument(
         "--role",
         choices=["connect", "listen"],
@@ -691,57 +2097,140 @@ def parse_args() -> argparse.Namespace:
         "--ack-timeout",
         type=float,
         default=1.5,
-        help="ACK timeout seconds",
     )
     parser.add_argument(
         "--retries",
         type=int,
         default=2,
-        help="Retry count",
     )
     parser.add_argument(
         "--payload-ip",
         default=ConnectionConfig.UDP_IP_TARGET,
-        help="Payload/gimbal IP",
     )
+
     parser.add_argument(
         "--ardupilot-endpoint",
         default=DEFAULT_ARDUPILOT_ENDPOINT,
         help=(
-            "Optional pymavlink endpoint. Default: "
-            f"{DEFAULT_ARDUPILOT_ENDPOINT}. Use 'none' to disable. "
-            "A dedicated mavlink-router UDP output is recommended."
+            "pymavlink endpoint used for vehicle GPS/ATTITUDE. "
+            "Use 'none' to disable."
         ),
     )
     parser.add_argument(
         "--ardupilot-sysid",
         type=int,
         default=0,
-        help="Expected ArduPilot SYSID; 0 = detect first autopilot heartbeat",
+        help=(
+            "Expected ArduPilot SYSID; "
+            "0 auto-detects the first autopilot heartbeat"
+        ),
     )
     parser.add_argument(
         "--ardupilot-stale-timeout",
         type=float,
         default=3.0,
-        help="Seconds without heartbeat before ArduPilot is considered offline",
     )
     parser.add_argument(
         "--position-stale-timeout",
         type=float,
         default=2.0,
-        help="Seconds before GLOBAL_POSITION_INT is considered stale",
     )
+    parser.add_argument(
+        "--attitude-stale-timeout",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--gimbal-stale-timeout",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--track-stale-timeout",
+        type=float,
+        default=1.0,
+    )
+
     parser.add_argument(
         "--track-box",
         type=int,
         default=DEFAULT_TRACK_BOX,
-        help="Gremsy acquisition box size centered on clicked pixel",
     )
+
+    parser.add_argument(
+        "--camera-height-agl",
+        type=float,
+        default=0.0,
+        help=(
+            "Override camera height above target ground plane in meters. "
+            "Recommended for ground tests. 0 = use relative_alt."
+        ),
+    )
+    parser.add_argument(
+        "--ground-alt-m",
+        type=float,
+        default=None,
+        help=(
+            "Optional fixed ground altitude in meters AMSL. "
+            "If supplied, height AGL = vehicle AMSL - this value."
+        ),
+    )
+    parser.add_argument(
+        "--min-down-angle-deg",
+        type=float,
+        default=5.0,
+        help=(
+            "Reject LOS solutions closer to the horizon than this."
+        ),
+    )
+    parser.add_argument(
+        "--max-ground-range-m",
+        type=float,
+        default=5000.0,
+    )
+
+    parser.add_argument(
+        "--fallback-hfov-deg",
+        type=float,
+        default=60.4,
+        help=(
+            "Used only until Lynx CAMERA_FOV_STATUS is received."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-vfov-deg",
+        type=float,
+        default=36.255,
+        help=(
+            "Used only until Lynx CAMERA_FOV_STATUS is received."
+        ),
+    )
+
+    parser.add_argument(
+        "--camera-roll-offset-deg",
+        type=float,
+        default=0.0,
+        help="Calibration offset applied to LOS roll.",
+    )
+    parser.add_argument(
+        "--camera-pitch-offset-deg",
+        type=float,
+        default=0.0,
+        help="Calibration offset applied to LOS pitch.",
+    )
+    parser.add_argument(
+        "--camera-yaw-offset-deg",
+        type=float,
+        default=0.0,
+        help="Calibration offset applied to LOS yaw.",
+    )
+
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
     app = RemoteExecutor(
         role=args.role,
         host=args.host,
@@ -752,10 +2241,49 @@ def main() -> int:
         payload_ip=args.payload_ip,
         ardupilot_endpoint=args.ardupilot_endpoint,
         ardupilot_sysid=args.ardupilot_sysid,
-        ardupilot_stale_timeout=args.ardupilot_stale_timeout,
-        position_stale_timeout=args.position_stale_timeout,
+        ardupilot_stale_timeout=(
+            args.ardupilot_stale_timeout
+        ),
+        position_stale_timeout=(
+            args.position_stale_timeout
+        ),
+        attitude_stale_timeout=(
+            args.attitude_stale_timeout
+        ),
+        gimbal_stale_timeout=(
+            args.gimbal_stale_timeout
+        ),
+        track_stale_timeout=(
+            args.track_stale_timeout
+        ),
         track_box=args.track_box,
+        camera_height_agl=(
+            args.camera_height_agl
+        ),
+        ground_alt_m=args.ground_alt_m,
+        min_down_angle_deg=(
+            args.min_down_angle_deg
+        ),
+        max_ground_range_m=(
+            args.max_ground_range_m
+        ),
+        fallback_hfov_deg=(
+            args.fallback_hfov_deg
+        ),
+        fallback_vfov_deg=(
+            args.fallback_vfov_deg
+        ),
+        camera_roll_offset_deg=(
+            args.camera_roll_offset_deg
+        ),
+        camera_pitch_offset_deg=(
+            args.camera_pitch_offset_deg
+        ),
+        camera_yaw_offset_deg=(
+            args.camera_yaw_offset_deg
+        ),
     )
+
     return app.start()
 
 

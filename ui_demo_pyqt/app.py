@@ -1,44 +1,25 @@
 #!/usr/bin/env python3
 # pyright: reportMissingImports=false
 """
-PyQt remote Gremsy payload UI.
+PyQt remote Gremsy Lynx UI.
 
-Interaction model
------------------
+Capabilities
+------------
 - Track unchecked:
-    click video -> move gimbal to clicked image pixel only.
-
+    click video -> point camera at image pixel.
 - Track checked:
-    click video -> begin Gremsy object tracking at clicked image pixel.
+    click video -> acquire/track object.
+- Hold Zoom In / Zoom Out:
+    continuous camera zoom; release stops zoom.
+- Polls GET_GEO_STATUS from remote_executor.py.
+- Shows:
+    * ArduPilot/GPS state
+    * vehicle roll/pitch/yaw
+    * gimbal roll/pitch/yaw
+    * tracking pixel/FOV
+    * approximate target GPS from flat-ground LOS intersection
 
-- Zoom buttons:
-    press and hold Zoom In / Zoom Out -> continuous zoom.
-    release -> stop zoom.
-
-Geolocation is optional:
-- After the remote bridge connects, the UI waits --geo-timeout seconds for
-  GEO_STATUS events from the backend.
-- If ArduPilot/GPS is not available before the timeout, point-camera and
-  tracking still work normally.
-- The UI shows a persistent warning that geolocation is unavailable.
-- If geolocation later becomes available, the warning clears automatically.
-
-Expected asynchronous backend event
------------------------------------
-The remote executor should periodically publish:
-
-    bridge.send_event(
-        "GEO_STATUS",
-        {
-            "ardupilot_connected": True,
-            "gps_valid": True,
-            "geolocation_available": True,
-            "target_lat": 38.1234567,   # optional until known
-            "target_lon": -94.1234567,  # optional until known
-            "target_alt": 250.0,        # optional until known
-            "detail": "GPS valid",
-        },
-    )
+The target GPS shown here is an ESTIMATE, not a surveyed fix.
 """
 
 import argparse
@@ -48,11 +29,10 @@ import os
 import sys
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-# Reuse shared bridge + config from existing project modules.
 sys.path.insert(
     0,
     os.path.join(
@@ -77,10 +57,10 @@ from widgets.video_widget import RtspVideoWidget
 
 CMD_PAYLOAD_TOUCH = "PAYLOAD_TOUCH"
 CMD_PAYLOAD_TRACK = "PAYLOAD_TRACK"
-CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
 CMD_PAYLOAD_ZOOM_IN = "PAYLOAD_ZOOM_IN"
 CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
 CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
+CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
 
 GREMSY_FRAME_W = 1920
 GREMSY_FRAME_H = 1080
@@ -89,61 +69,53 @@ DEFAULT_GEO_TIMEOUT_S = 8.0
 
 
 class GeoPollSignals(QtCore.QObject):
-    """Thread-safe handoff from geolocation polling thread into Qt."""
-
     result = QtCore.Signal(bool, str)
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, args: argparse.Namespace):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+    ):
         super().__init__()
 
         self.setWindowTitle(
-            "Payload UI Demo - Click / Track / Zoom"
+            "Payload UI Demo - Click / Track / Zoom / Target Geo"
         )
-        self.resize(1400, 900)
+        self.resize(1450, 930)
 
-        self.bridge: Optional[TcpCommandBridge] = None
+        self.bridge: Optional[
+            TcpCommandBridge
+        ] = None
         self.bridge_connected = False
         self.tracking_enabled = False
         self.zoom_active = False
-        self.geo_poll_in_flight = False
-        self._last_bridge_state = False
 
-        # --------------------------------------------------------------
-        # Optional geolocation state
-        # --------------------------------------------------------------
         self.geo_timeout_s = max(
             0.0,
             float(args.geo_timeout),
         )
-
-        self.geo_wait_started: Optional[float] = None
+        self.geo_wait_started: Optional[
+            float
+        ] = None
         self.geo_timeout_notified = False
 
-        self.ardupilot_connected = False
-        self.gps_valid = False
-        self.geolocation_available = False
-        self.last_geo_event_time: Optional[float] = None
-
-        self.target_lat: Optional[float] = None
-        self.target_lon: Optional[float] = None
-        self.target_alt: Optional[float] = None
-
-        self.geo_poll_signals = GeoPollSignals()
-        self.geo_poll_signals.result.connect(
+        self._geo_poll_busy = False
+        self._geo_poll_lock = (
+            threading.Lock()
+        )
+        self._geo_signals = GeoPollSignals()
+        self._geo_signals.result.connect(
             self._on_geo_poll_result
         )
 
         self._build_ui()
         self._apply_defaults(args)
 
-        # Periodically checks whether the optional geolocation grace
-        # period has expired.
         self.geo_timer = QtCore.QTimer(self)
-        self.geo_timer.setInterval(1000)
+        self.geo_timer.setInterval(500)
         self.geo_timer.timeout.connect(
-            self._periodic_status_update
+            self._poll_geo_status
         )
         self.geo_timer.start()
 
@@ -157,10 +129,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         layout = QtWidgets.QVBoxLayout(root)
         layout.setContentsMargins(
-            12,
-            12,
-            12,
-            12,
+            12, 12, 12, 12
         )
         layout.setSpacing(10)
 
@@ -182,15 +151,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.host_edit = QtWidgets.QLineEdit()
 
         self.port_spin = QtWidgets.QSpinBox()
-        self.port_spin.setRange(1, 65535)
+        self.port_spin.setRange(
+            1, 65535
+        )
 
         self.token_edit = QtWidgets.QLineEdit()
         self.token_edit.setEchoMode(
             QtWidgets.QLineEdit.EchoMode.Password
         )
 
-        self.connect_button = QtWidgets.QPushButton(
-            "Connect Bridge"
+        self.connect_button = (
+            QtWidgets.QPushButton(
+                "Connect Bridge"
+            )
         )
         self.connect_button.clicked.connect(
             self._toggle_bridge
@@ -205,112 +178,165 @@ class MainWindow(QtWidgets.QMainWindow):
 
         conn_grid.addWidget(
             QtWidgets.QLabel("Role"),
-            0,
-            0,
+            0, 0,
         )
         conn_grid.addWidget(
             self.role_combo,
-            0,
-            1,
+            0, 1,
         )
         conn_grid.addWidget(
             QtWidgets.QLabel("Host"),
-            0,
-            2,
+            0, 2,
         )
         conn_grid.addWidget(
             self.host_edit,
-            0,
-            3,
+            0, 3,
         )
         conn_grid.addWidget(
             QtWidgets.QLabel("Port"),
-            0,
-            4,
+            0, 4,
         )
         conn_grid.addWidget(
             self.port_spin,
-            0,
-            5,
+            0, 5,
         )
         conn_grid.addWidget(
             QtWidgets.QLabel("Token"),
-            0,
-            6,
+            0, 6,
         )
         conn_grid.addWidget(
             self.token_edit,
-            0,
-            7,
+            0, 7,
         )
         conn_grid.addWidget(
             self.connect_button,
-            0,
-            8,
+            0, 8,
         )
         conn_grid.addWidget(
             self.bridge_status,
-            0,
-            9,
+            0, 9,
         )
 
         # --------------------------------------------------------------
-        # Optional geolocation status
+        # Target geolocation telemetry
         # --------------------------------------------------------------
         geo_group = QtWidgets.QGroupBox(
-            "Target Geolocation (Optional)"
+            "Approximate Target Geolocation"
         )
         geo_grid = QtWidgets.QGridLayout(
             geo_group
         )
 
-        self.geo_status_label = QtWidgets.QLabel()
-        self.geo_status_label.setWordWrap(True)
-        self._set_geo_status_neutral(
-            "Geolocation: waiting for remote bridge"
+        self.geo_status_label = QtWidgets.QLabel(
+            "Estimator: waiting for bridge"
+        )
+        self.geo_status_label.setWordWrap(
+            True
+        )
+        self.geo_status_label.setStyleSheet(
+            "color: #94a3b8; font-weight: 600;"
         )
 
-        self.ardupilot_status_label = QtWidgets.QLabel(
-            "ArduPilot: --"
+        self.ardupilot_status_label = (
+            QtWidgets.QLabel(
+                "ArduPilot: --"
+            )
         )
         self.gps_status_label = QtWidgets.QLabel(
             "GPS: --"
         )
 
-        self.target_position_label = QtWidgets.QLabel(
-            "Target: --"
+        self.vehicle_position_label = (
+            QtWidgets.QLabel(
+                "Vehicle: --"
+            )
+        )
+
+        self.vehicle_attitude_label = (
+            QtWidgets.QLabel(
+                "Vehicle attitude: --"
+            )
+        )
+
+        self.gimbal_attitude_label = (
+            QtWidgets.QLabel(
+                "Gimbal attitude: --"
+            )
+        )
+
+        self.track_info_label = QtWidgets.QLabel(
+            "Track: --"
+        )
+
+        self.target_position_label = (
+            QtWidgets.QLabel(
+                "Estimated target: --"
+            )
+        )
+        self.target_position_label.setStyleSheet(
+            "font-weight: 700;"
         )
         self.target_position_label.setTextInteractionFlags(
             QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
         )
 
+        self.range_label = QtWidgets.QLabel(
+            "Geometry: --"
+        )
+
+        self.native_target_label = QtWidgets.QLabel(
+            "Gremsy TARGET_*: --"
+        )
+        self.native_target_label.setStyleSheet(
+            "color: #64748b;"
+        )
+
         geo_grid.addWidget(
             self.geo_status_label,
-            0,
-            0,
-            1,
-            4,
+            0, 0, 1, 4,
         )
         geo_grid.addWidget(
             self.ardupilot_status_label,
-            1,
-            0,
+            1, 0,
         )
         geo_grid.addWidget(
             self.gps_status_label,
-            1,
-            1,
+            1, 1,
         )
         geo_grid.addWidget(
+            self.vehicle_position_label,
+            1, 2, 1, 2,
+        )
+
+        geo_grid.addWidget(
+            self.vehicle_attitude_label,
+            2, 0, 1, 2,
+        )
+        geo_grid.addWidget(
+            self.gimbal_attitude_label,
+            2, 2, 1, 2,
+        )
+
+        geo_grid.addWidget(
+            self.track_info_label,
+            3, 0, 1, 2,
+        )
+        geo_grid.addWidget(
+            self.range_label,
+            3, 2, 1, 2,
+        )
+
+        geo_grid.addWidget(
             self.target_position_label,
-            1,
-            2,
-            1,
-            2,
+            4, 0, 1, 4,
+        )
+        geo_grid.addWidget(
+            self.native_target_label,
+            5, 0, 1, 4,
         )
 
         # --------------------------------------------------------------
-        # RTSP stream controls
+        # RTSP
         # --------------------------------------------------------------
         stream_group = QtWidgets.QGroupBox(
             "RTSP Stream"
@@ -358,7 +384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         # --------------------------------------------------------------
-        # Video controls
+        # Controls
         # --------------------------------------------------------------
         controls_row = QtWidgets.QHBoxLayout()
 
@@ -366,15 +392,17 @@ class MainWindow(QtWidgets.QMainWindow):
             "Track"
         )
         self.track_checkbox.setToolTip(
-            "Unchecked: click moves camera. "
-            "Checked: click begins object tracking."
+            "Unchecked: click points camera. "
+            "Checked: click acquires/tracks target."
         )
         self.track_checkbox.stateChanged.connect(
             self._on_track_toggled
         )
 
-        self.stop_tracking_button = QtWidgets.QPushButton(
-            "Stop Tracking"
+        self.stop_tracking_button = (
+            QtWidgets.QPushButton(
+                "Stop Tracking"
+            )
         )
         self.stop_tracking_button.clicked.connect(
             self._stop_tracking
@@ -387,11 +415,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "font-weight: 600;"
         )
 
-        self.zoom_out_button = QtWidgets.QPushButton(
-            "Zoom Out -"
+        self.zoom_out_button = (
+            QtWidgets.QPushButton(
+                "Zoom Out -"
+            )
         )
         self.zoom_out_button.setToolTip(
-            "Press and hold to zoom out; release to stop."
+            "Press and hold to zoom out."
         )
         self.zoom_out_button.pressed.connect(
             self._zoom_out_pressed
@@ -400,11 +430,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._zoom_released
         )
 
-        self.zoom_in_button = QtWidgets.QPushButton(
-            "Zoom In +"
+        self.zoom_in_button = (
+            QtWidgets.QPushButton(
+                "Zoom In +"
+            )
         )
         self.zoom_in_button.setToolTip(
-            "Press and hold to zoom in; release to stop."
+            "Press and hold to zoom in."
         )
         self.zoom_in_button.pressed.connect(
             self._zoom_in_pressed
@@ -481,7 +513,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
 
     def _toggle_bridge(self) -> None:
-        if self.bridge is not None:
+        if self.bridge_connected:
             self._disconnect_bridge()
             return
 
@@ -490,26 +522,31 @@ class MainWindow(QtWidgets.QMainWindow):
             host=self.host_edit.text().strip(),
             port=self.port_spin.value(),
             token=self.token_edit.text().strip(),
-            connect_timeout=RemoteBridgeConfig.CONNECT_TIMEOUT,
-            ack_timeout=RemoteBridgeConfig.ACK_TIMEOUT,
-            retry_count=RemoteBridgeConfig.RETRY_COUNT,
-            reconnect_interval=RemoteBridgeConfig.RECONNECT_INTERVAL,
+            connect_timeout=(
+                RemoteBridgeConfig.CONNECT_TIMEOUT
+            ),
+            ack_timeout=(
+                RemoteBridgeConfig.ACK_TIMEOUT
+            ),
+            retry_count=(
+                RemoteBridgeConfig.RETRY_COUNT
+            ),
+            reconnect_interval=(
+                RemoteBridgeConfig.RECONNECT_INTERVAL
+            ),
         )
 
         self.bridge = TcpCommandBridge(
             cfg,
             logger=self._bridge_log,
         )
-
         self.bridge.start()
 
-        self.connect_button.setText(
-            "Disconnect Bridge"
-        )
-
         if cfg.role == "connect":
-            connected = self.bridge.wait_until_connected(
-                RemoteBridgeConfig.CONNECT_TIMEOUT
+            connected = (
+                self.bridge.wait_until_connected(
+                    RemoteBridgeConfig.CONNECT_TIMEOUT
+                )
             )
 
             if not connected:
@@ -519,25 +556,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._disconnect_bridge()
                 return
 
-        if self.bridge.is_connected():
-            self._mark_bridge_connected()
-        else:
-            self.bridge_status.setText(
-                "Waiting for peer"
-            )
-            self.bridge_status.setStyleSheet(
-                "color: #f59e0b; font-weight: 600;"
-            )
-            self.status_label.setText(
-                "Bridge listening - waiting for executor"
-            )
-
-
-    def _mark_bridge_connected(self) -> None:
-        was_connected = self.bridge_connected
-
         self.bridge_connected = True
-
         self.connect_button.setText(
             "Disconnect Bridge"
         )
@@ -551,49 +570,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "Bridge ready"
         )
 
-        if not was_connected:
-            self._begin_geo_wait()
-
-            # Avoid calling a blocking ACK request directly inside a
-            # connection callback.
-            QtCore.QTimer.singleShot(
-                0,
-                self._sync_tracking_mode,
-            )
-            QtCore.QTimer.singleShot(
-                0,
-                self._sync_zoom_stop,
-            )
-
-    def _sync_zoom_stop(self) -> None:
-        if not self.bridge_connected:
-            return
-
-        self._send_remote_command(
-            CMD_PAYLOAD_ZOOM_STOP,
-            [],
+        self.geo_wait_started = (
+            time.monotonic()
         )
-
-    def _mark_bridge_disconnected(self) -> None:
-        self.bridge_connected = False
-
-        self.bridge_status.setText(
-            "Reconnecting..."
-        )
-        self.bridge_status.setStyleSheet(
-            "color: #f59e0b; font-weight: 600;"
-        )
-        self.status_label.setText(
-            "Remote bridge disconnected"
-        )
-
-        self._reset_geo_state(
-            "Geolocation: bridge disconnected"
-        )
-
-    def _sync_tracking_mode(self) -> None:
-        if not self.bridge_connected:
-            return
+        self.geo_timeout_notified = False
 
         self._send_remote_command(
             CMD_PAYLOAD_TRACK,
@@ -604,26 +584,31 @@ class MainWindow(QtWidgets.QMainWindow):
             ],
         )
 
-    def _disconnect_bridge(self) -> None:
-        bridge = self.bridge
-        self.bridge = None
+        self._send_remote_command(
+            CMD_PAYLOAD_ZOOM_STOP,
+            [],
+        )
 
-        if bridge is not None:
-            if self.bridge_connected:
-                try:
-                    bridge.send_command(
-                        command=CMD_PAYLOAD_ZOOM_STOP,
-                        params=[],
-                        ack_required=True,
-                    )
-                except Exception:
-                    pass
-            bridge.stop()
+    def _disconnect_bridge(self) -> None:
+        if (
+            self.bridge_connected
+            and self.bridge is not None
+        ):
+            try:
+                self._send_remote_command(
+                    CMD_PAYLOAD_ZOOM_STOP,
+                    [],
+                )
+            except Exception:
+                pass
+
+        if self.bridge is not None:
+            self.bridge.stop()
+            self.bridge = None
 
         self.bridge_connected = False
         self.tracking_enabled = False
         self.zoom_active = False
-        self.geo_poll_in_flight = False
 
         self.connect_button.setText(
             "Connect Bridge"
@@ -635,8 +620,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "color: #e11d48; font-weight: 600;"
         )
 
-        self._reset_geo_state(
-            "Geolocation: waiting for remote bridge"
+        self.geo_wait_started = None
+        self.geo_status_label.setText(
+            "Estimator: waiting for bridge"
+        )
+        self.geo_status_label.setStyleSheet(
+            "color: #94a3b8; font-weight: 600;"
         )
 
     def _send_remote_command(
@@ -647,12 +636,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if (
             not self.bridge_connected
             or self.bridge is None
-            or not self.bridge.is_connected()
         ):
             detail = (
                 f"Bridge offline, skipped {command}"
             )
-            self.status_label.setText(detail)
+            self.status_label.setText(
+                detail
+            )
             return False, detail
 
         ok, detail = self.bridge.send_command(
@@ -679,124 +669,53 @@ class MainWindow(QtWidgets.QMainWindow):
         print(msg)
 
     # ------------------------------------------------------------------
-    # Optional geolocation
+    # Geolocation polling
     # ------------------------------------------------------------------
 
-    def _begin_geo_wait(self) -> None:
-        self.geo_wait_started = time.monotonic()
-        self.geo_timeout_notified = False
-
-        self.ardupilot_connected = False
-        self.gps_valid = False
-        self.geolocation_available = False
-        self.last_geo_event_time = None
-
-        self.target_lat = None
-        self.target_lon = None
-        self.target_alt = None
-
-        self.ardupilot_status_label.setText(
-            "ArduPilot: waiting"
-        )
-        self.gps_status_label.setText(
-            "GPS: waiting"
-        )
-        self.target_position_label.setText(
-            "Target: --"
-        )
-
-        self._set_geo_status_waiting(
-            f"Waiting up to {self.geo_timeout_s:.1f}s "
-            "for ArduPilot/GPS. "
-            "Pointing and tracking remain available."
-        )
-
-    def _reset_geo_state(
-        self,
-        message: str,
-    ) -> None:
-        self.geo_wait_started = None
-        self.geo_timeout_notified = False
-
-        self.ardupilot_connected = False
-        self.gps_valid = False
-        self.geolocation_available = False
-        self.last_geo_event_time = None
-
-        self.target_lat = None
-        self.target_lon = None
-        self.target_alt = None
-
-        self.ardupilot_status_label.setText(
-            "ArduPilot: --"
-        )
-        self.gps_status_label.setText(
-            "GPS: --"
-        )
-        self.target_position_label.setText(
-            "Target: --"
-        )
-
-        self._set_geo_status_neutral(
-            message
-        )
-
-    def _periodic_status_update(self) -> None:
-        """
-        Monitor bridge connection, poll geolocation without blocking Qt,
-        and update the optional geolocation timeout warning.
-        """
-        bridge_now_connected = (
-            self.bridge is not None
-            and self.bridge.is_connected()
-        )
-
-        if bridge_now_connected and not self.bridge_connected:
-            self._mark_bridge_connected()
-        elif not bridge_now_connected and self.bridge_connected:
-            self._mark_bridge_disconnected()
-
+    def _poll_geo_status(self) -> None:
         if (
-            self.bridge_connected
-            and not self.geo_poll_in_flight
-        ):
-            self._start_geo_poll()
-
-        self._update_geo_timeout_state()
-
-    def _start_geo_poll(self) -> None:
-        bridge = self.bridge
-
-        if (
-            bridge is None
-            or not bridge.is_connected()
-            or self.geo_poll_in_flight
+            not self.bridge_connected
+            or self.bridge is None
         ):
             return
 
-        self.geo_poll_in_flight = True
+        with self._geo_poll_lock:
+            if self._geo_poll_busy:
+                return
+            self._geo_poll_busy = True
 
-        def worker() -> None:
-            try:
-                ok, detail = bridge.send_command(
-                    command=CMD_GET_GEO_STATUS,
-                    params=[],
-                    ack_required=True,
-                )
-            except Exception as exc:
-                ok = False
-                detail = f"geolocation poll error: {exc}"
+        bridge = self.bridge
 
-            self.geo_poll_signals.result.emit(
+        thread = threading.Thread(
+            target=self._geo_poll_worker,
+            args=(bridge,),
+            daemon=True,
+            name="geo-status-poll",
+        )
+        thread.start()
+
+    def _geo_poll_worker(
+        self,
+        bridge: TcpCommandBridge,
+    ) -> None:
+        try:
+            ok, detail = bridge.send_command(
+                command=CMD_GET_GEO_STATUS,
+                params=[],
+                ack_required=True,
+            )
+            self._geo_signals.result.emit(
                 ok,
                 detail,
             )
-
-        threading.Thread(
-            target=worker,
-            daemon=True,
-            name="geo-status-poll",
-        ).start()
+        except Exception as exc:
+            self._geo_signals.result.emit(
+                False,
+                str(exc),
+            )
+        finally:
+            with self._geo_poll_lock:
+                self._geo_poll_busy = False
 
     @QtCore.Slot(bool, str)
     def _on_geo_poll_result(
@@ -804,204 +723,410 @@ class MainWindow(QtWidgets.QMainWindow):
         ok: bool,
         detail: str,
     ) -> None:
-        self.geo_poll_in_flight = False
+        if not self.bridge_connected:
+            return
 
         if not ok:
+            self._handle_geo_not_ready(
+                f"Status request failed: {detail}"
+            )
             return
 
         try:
             data = json.loads(detail)
         except Exception as exc:
-            print(
-                f"[GEO] invalid GET_GEO_STATUS response: {exc}"
+            self._handle_geo_not_ready(
+                f"Invalid GEO_STATUS: {exc}"
             )
             return
 
-        if not isinstance(data, dict):
-            return
+        self._render_geo_status(data)
 
-        self.last_geo_event_time = time.monotonic()
+    def _handle_geo_not_ready(
+        self,
+        message: str,
+    ) -> None:
+        elapsed = 0.0
 
-        self.ardupilot_connected = bool(
+        if self.geo_wait_started is not None:
+            elapsed = (
+                time.monotonic()
+                - self.geo_wait_started
+            )
+
+        if elapsed >= self.geo_timeout_s:
+            self.geo_status_label.setText(
+                "Estimator unavailable: "
+                f"{message}. "
+                "Pointing/tracking still work."
+            )
+            self.geo_status_label.setStyleSheet(
+                "color: #f59e0b; font-weight: 700;"
+            )
+        else:
+            self.geo_status_label.setText(
+                f"Estimator: {message}"
+            )
+            self.geo_status_label.setStyleSheet(
+                "color: #f59e0b; font-weight: 600;"
+            )
+
+    def _render_geo_status(
+        self,
+        data: Dict,
+    ) -> None:
+        ap_connected = bool(
             data.get(
                 "ardupilot_connected",
                 False,
             )
         )
-
-        self.gps_valid = bool(
+        gps_valid = bool(
             data.get(
                 "gps_valid",
                 False,
             )
         )
-
-        if "geolocation_available" in data:
-            self.geolocation_available = bool(
-                data.get(
-                    "geolocation_available"
-                )
+        estimate_valid = bool(
+            data.get(
+                "estimate_valid",
+                False,
             )
-        else:
-            self.geolocation_available = (
-                self.ardupilot_connected
-                and self.gps_valid
-            )
+        )
 
         self.ardupilot_status_label.setText(
             "ArduPilot: Connected"
-            if self.ardupilot_connected
+            if ap_connected
             else "ArduPilot: Not connected"
         )
-
         self.gps_status_label.setText(
             "GPS: Valid"
-            if self.gps_valid
-            else "GPS: Unavailable"
+            if gps_valid
+            else "GPS: Invalid / waiting"
         )
 
-        target_lat = self._optional_finite_float(
-            data.get("target_lat")
+        vehicle_lat = self._num(
+            data.get("vehicle_lat")
         )
-        target_lon = self._optional_finite_float(
-            data.get("target_lon")
+        vehicle_lon = self._num(
+            data.get("vehicle_lon")
         )
-        target_alt = self._optional_finite_float(
-            data.get("target_alt")
+        vehicle_alt = self._num(
+            data.get("vehicle_alt_m")
         )
 
-        if target_lat is not None:
-            self.target_lat = target_lat
-
-        if target_lon is not None:
-            self.target_lon = target_lon
-
-        if target_alt is not None:
-            self.target_alt = target_alt
-
-        self._refresh_target_position_label()
-
-        status_detail = str(
-            data.get("detail", "")
-        ).strip()
-
-        if self.geolocation_available:
-            self.geo_timeout_notified = False
-            self._set_geo_status_ok(
-                status_detail
-                or "Geolocation available"
+        if (
+            vehicle_lat is not None
+            and vehicle_lon is not None
+        ):
+            vehicle_text = (
+                f"Vehicle: "
+                f"{vehicle_lat:.7f}, "
+                f"{vehicle_lon:.7f}"
             )
-            return
 
-        if not self._geo_deadline_expired():
-            if self.ardupilot_connected:
-                self._set_geo_status_waiting(
-                    status_detail
-                    or (
-                        "ArduPilot connected; "
-                        "waiting for valid GPS/geolocation."
-                    )
+            if vehicle_alt is not None:
+                vehicle_text += (
+                    f", alt={vehicle_alt:.1f} m"
                 )
-            else:
-                self._set_geo_status_waiting(
-                    status_detail
-                    or (
-                        f"Waiting for ArduPilot "
-                        f"({self.geo_timeout_s:.1f}s grace period)."
-                    )
-                )
-            return
 
-        self._notify_geo_unavailable_once(
-            status_detail
-        )
-
-    def _update_geo_timeout_state(self) -> None:
-        if not self.bridge_connected:
-            return
-
-        if self.geolocation_available:
-            return
-
-        if not self._geo_deadline_expired():
-            return
-
-        self._notify_geo_unavailable_once("")
-
-    def _geo_deadline_expired(self) -> bool:
-        if self.geo_wait_started is None:
-            return False
-
-        return (
-            time.monotonic()
-            - self.geo_wait_started
-            >= self.geo_timeout_s
-        )
-
-    def _notify_geo_unavailable_once(
-        self,
-        detail: str,
-    ) -> None:
-        if self.ardupilot_connected:
-            message = (
-                "Geolocation unavailable: ArduPilot is connected, "
-                "but valid GPS/target geolocation was not received. "
-                "Pointing and tracking are still available."
+            self.vehicle_position_label.setText(
+                vehicle_text
             )
         else:
-            message = (
-                "Geolocation unavailable: no ArduPilot "
-                f"connection/status after {self.geo_timeout_s:.1f}s. "
-                "Pointing and tracking are still available."
+            self.vehicle_position_label.setText(
+                "Vehicle: --"
             )
 
-        if detail:
-            message = f"{message} {detail}"
-
-        self._set_geo_status_warning(
-            message
+        vr = self._num(
+            data.get("vehicle_roll_deg")
+        )
+        vp = self._num(
+            data.get("vehicle_pitch_deg")
+        )
+        vy = self._num(
+            data.get("vehicle_yaw_deg")
         )
 
-        # Avoid spamming the same warning every timer tick.
-        if not self.geo_timeout_notified:
-            self.geo_timeout_notified = True
-            print(
-                f"[GEO] {message}"
-            )
-
-    def _refresh_target_position_label(
-        self,
-    ) -> None:
         if (
-            self.target_lat is None
-            or self.target_lon is None
+            vr is not None
+            and vp is not None
+            and vy is not None
         ):
-            if self.geolocation_available:
-                self.target_position_label.setText(
-                    "Target: waiting for target coordinate"
-                )
-            else:
-                self.target_position_label.setText(
-                    "Target: --"
-                )
-            return
-
-        text = (
-            f"Target: {self.target_lat:.7f}, "
-            f"{self.target_lon:.7f}"
-        )
-
-        if self.target_alt is not None:
-            text += (
-                f", alt={self.target_alt:.1f} m"
+            self.vehicle_attitude_label.setText(
+                f"Vehicle attitude: "
+                f"R {vr:.1f}°  "
+                f"P {vp:.1f}°  "
+                f"Y {vy:.1f}°"
+            )
+        else:
+            self.vehicle_attitude_label.setText(
+                "Vehicle attitude: --"
             )
 
-        self.target_position_label.setText(
-            text
+        gr = self._num(
+            data.get("gimbal_roll_deg")
         )
+        gp = self._num(
+            data.get("gimbal_pitch_deg")
+        )
+        gy = self._num(
+            data.get("gimbal_yaw_deg")
+        )
+        gframe = str(
+            data.get(
+                "gimbal_frame",
+                "unknown",
+            )
+        )
+
+        if (
+            gr is not None
+            and gp is not None
+            and gy is not None
+        ):
+            self.gimbal_attitude_label.setText(
+                f"Gimbal attitude: "
+                f"R {gr:.1f}°  "
+                f"P {gp:.1f}°  "
+                f"Y {gy:.1f}° "
+                f"({gframe})"
+            )
+        else:
+            self.gimbal_attitude_label.setText(
+                "Gimbal attitude: --"
+            )
+
+        tx = self._num(
+            data.get("track_x")
+        )
+        ty = self._num(
+            data.get("track_y")
+        )
+        track_status = data.get(
+            "track_status"
+        )
+        track_source = str(
+            data.get(
+                "track_pixel_source",
+                "none",
+            )
+        )
+
+        hfov = self._num(
+            data.get("hfov_deg")
+        )
+        vfov = self._num(
+            data.get("vfov_deg")
+        )
+        fov_source = str(
+            data.get(
+                "fov_source",
+                "unknown",
+            )
+        )
+
+        track_text = "Track: "
+
+        if tx is not None and ty is not None:
+            track_text += (
+                f"pixel=({tx:.0f}, {ty:.0f}) "
+                f"[{track_source}]"
+            )
+        else:
+            track_text += "--"
+
+        if track_status is not None:
+            status_name = {
+                0: "IDLE",
+                1: "TRACKED",
+                2: "LOST",
+            }.get(
+                int(track_status),
+                str(track_status),
+            )
+            track_text += (
+                f" status={status_name}"
+            )
+
+        if (
+            hfov is not None
+            and vfov is not None
+        ):
+            track_text += (
+                f" FOV={hfov:.1f}°x"
+                f"{vfov:.1f}° "
+                f"[{fov_source}]"
+            )
+
+        self.track_info_label.setText(
+            track_text
+        )
+
+        down_angle = self._num(
+            data.get("los_down_deg")
+        )
+        azimuth = self._num(
+            data.get("los_azimuth_deg")
+        )
+        ground_range = self._num(
+            data.get("ground_range_m")
+        )
+        height_agl = self._num(
+            data.get("height_agl_m")
+        )
+        height_source = str(
+            data.get(
+                "height_source",
+                "none",
+            )
+        )
+
+        pieces = []
+
+        if height_agl is not None:
+            pieces.append(
+                f"AGL={height_agl:.1f}m"
+                f"[{height_source}]"
+            )
+        if azimuth is not None:
+            pieces.append(
+                f"LOS az={azimuth:.1f}°"
+            )
+        if down_angle is not None:
+            pieces.append(
+                f"down={down_angle:.1f}°"
+            )
+        if ground_range is not None:
+            pieces.append(
+                f"range≈{ground_range:.1f}m"
+            )
+
+        self.range_label.setText(
+            "Geometry: "
+            + (
+                "  ".join(pieces)
+                if pieces
+                else "--"
+            )
+        )
+
+        est_lat = self._num(
+            data.get(
+                "estimated_target_lat"
+            )
+        )
+        est_lon = self._num(
+            data.get(
+                "estimated_target_lon"
+            )
+        )
+        est_alt = self._num(
+            data.get(
+                "estimated_target_alt_m"
+            )
+        )
+
+        reason = str(
+            data.get(
+                "estimate_reason",
+                "",
+            )
+        )
+
+        if (
+            estimate_valid
+            and est_lat is not None
+            and est_lon is not None
+        ):
+            target_text = (
+                "Estimated target: "
+                f"{est_lat:.7f}, "
+                f"{est_lon:.7f}"
+            )
+
+            if est_alt is not None:
+                target_text += (
+                    f", alt≈{est_alt:.1f} m"
+                )
+
+            self.target_position_label.setText(
+                target_text
+            )
+            self.target_position_label.setStyleSheet(
+                "color: #16a34a; font-weight: 700;"
+            )
+
+            self.geo_status_label.setText(
+                "Estimator: target solution valid "
+                "(flat-ground approximation)"
+            )
+            self.geo_status_label.setStyleSheet(
+                "color: #16a34a; font-weight: 700;"
+            )
+
+            print(
+                "[TARGET EST] "
+                f"lat={est_lat:.7f} "
+                f"lon={est_lon:.7f} "
+                + (
+                    f"range={ground_range:.1f}m"
+                    if ground_range is not None
+                    else ""
+                )
+            )
+        else:
+            self.target_position_label.setText(
+                "Estimated target: --"
+            )
+            self.target_position_label.setStyleSheet(
+                "font-weight: 700;"
+            )
+
+            self._handle_geo_not_ready(
+                reason
+                or "No target solution yet"
+            )
+
+        native_lat = self._num(
+            data.get("gremsy_target_lat")
+        )
+        native_lon = self._num(
+            data.get("gremsy_target_lon")
+        )
+        native_alt = self._num(
+            data.get("gremsy_target_alt")
+        )
+
+        if (
+            native_lat is not None
+            and native_lon is not None
+            and not (
+                abs(native_lat) < 1e-12
+                and abs(native_lon) < 1e-12
+            )
+        ):
+            text = (
+                "Gremsy TARGET_*: "
+                f"{native_lat:.7f}, "
+                f"{native_lon:.7f}"
+            )
+
+            if native_alt is not None:
+                text += (
+                    f", alt={native_alt:.1f} m"
+                )
+
+            self.native_target_label.setText(
+                text
+            )
+        else:
+            self.native_target_label.setText(
+                "Gremsy TARGET_*: not provided"
+            )
 
     @staticmethod
-    def _optional_finite_float(
+    def _num(
         value,
     ) -> Optional[float]:
         if value is None:
@@ -1009,7 +1134,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             number = float(value)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
 
         if not math.isfinite(number):
@@ -1017,56 +1145,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return number
 
-    def _set_geo_status_ok(
-        self,
-        message: str,
-    ) -> None:
-        self.geo_status_label.setText(
-            f"Geolocation: {message}"
-        )
-        self.geo_status_label.setStyleSheet(
-            "color: #16a34a; font-weight: 600;"
-        )
-
-    def _set_geo_status_waiting(
-        self,
-        message: str,
-    ) -> None:
-        self.geo_status_label.setText(
-            f"Geolocation: {message}"
-        )
-        self.geo_status_label.setStyleSheet(
-            "color: #f59e0b; font-weight: 600;"
-        )
-
-    def _set_geo_status_warning(
-        self,
-        message: str,
-    ) -> None:
-        self.geo_status_label.setText(
-            f"WARNING: {message}"
-        )
-        self.geo_status_label.setStyleSheet(
-            "color: #f59e0b; font-weight: 700;"
-        )
-
-    def _set_geo_status_neutral(
-        self,
-        message: str,
-    ) -> None:
-        self.geo_status_label.setText(
-            message
-        )
-        self.geo_status_label.setStyleSheet(
-            "color: #94a3b8; font-weight: 600;"
-        )
-
     # ------------------------------------------------------------------
     # RTSP
     # ------------------------------------------------------------------
 
     def _start_stream(self) -> None:
-        url = self.rtsp_url_edit.text().strip()
+        url = (
+            self.rtsp_url_edit.text()
+            .strip()
+        )
 
         if not url:
             self.status_label.setText(
@@ -1086,12 +1173,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stop_stream(self) -> None:
         self.video_widget.stop_stream()
+
         self.status_label.setText(
             "Stream stopped"
         )
 
     # ------------------------------------------------------------------
-    # Tracking mode
+    # Track
     # ------------------------------------------------------------------
 
     def _on_track_toggled(
@@ -1110,14 +1198,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Click mode: Track Target"
             )
             self.status_label.setText(
-                "Track enabled - click a target"
+                "Track enabled - click target"
             )
         else:
             self.mode_label.setText(
                 "Click mode: Point Camera"
             )
             self.status_label.setText(
-                "Track disabled - click to point camera"
+                "Track disabled - click to point"
             )
 
         if self.bridge_connected:
@@ -1214,7 +1302,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     # ------------------------------------------------------------------
-    # Coordinate conversion
+    # Click mapping
     # ------------------------------------------------------------------
 
     def _widget_point_to_payload(
@@ -1223,17 +1311,28 @@ class MainWindow(QtWidgets.QMainWindow):
         y_widget: float,
         frame_w: int,
         frame_h: int,
-    ) -> Optional[Tuple[int, int]]:
-        if frame_w <= 0 or frame_h <= 0:
+    ) -> Optional[
+        Tuple[int, int]
+    ]:
+        if (
+            frame_w <= 0
+            or frame_h <= 0
+        ):
             return None
 
-        widget_w = self.video_widget.width()
-        widget_h = self.video_widget.height()
+        widget_w = (
+            self.video_widget.width()
+        )
+        widget_h = (
+            self.video_widget.height()
+        )
 
-        if widget_w <= 0 or widget_h <= 0:
+        if (
+            widget_w <= 0
+            or widget_h <= 0
+        ):
             return None
 
-        # Qt KeepAspectRatio scaling used by the video widget.
         scale = min(
             widget_w / frame_w,
             widget_h / frame_h,
@@ -1245,35 +1344,31 @@ class MainWindow(QtWidgets.QMainWindow):
         offset_x = (
             widget_w - displayed_w
         ) / 2.0
-
         offset_y = (
             widget_h - displayed_h
         ) / 2.0
 
-        # Ignore clicks in letterbox/pillarbox space.
         if (
             x_widget < offset_x
-            or x_widget >= offset_x + displayed_w
+            or x_widget
+            >= offset_x + displayed_w
             or y_widget < offset_y
-            or y_widget >= offset_y + displayed_h
+            or y_widget
+            >= offset_y + displayed_h
         ):
             return None
 
-        # Widget -> actual RTSP source frame.
         x_src = (
             x_widget - offset_x
         ) / scale
-
         y_src = (
             y_widget - offset_y
         ) / scale
 
-        # Source frame -> Gremsy's fixed 1920 x 1080 coordinate space.
         x_payload = round(
             (x_src / frame_w)
             * GREMSY_FRAME_W
         )
-
         y_payload = round(
             (y_src / frame_h)
             * GREMSY_FRAME_H
@@ -1286,7 +1381,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 x_payload,
             ),
         )
-
         y_payload = max(
             0,
             min(
@@ -1300,10 +1394,6 @@ class MainWindow(QtWidgets.QMainWindow):
             y_payload,
         )
 
-    # ------------------------------------------------------------------
-    # Click handler
-    # ------------------------------------------------------------------
-
     def _on_video_clicked(
         self,
         x_widget: float,
@@ -1311,16 +1401,18 @@ class MainWindow(QtWidgets.QMainWindow):
         frame_w: int,
         frame_h: int,
     ) -> None:
-        point = self._widget_point_to_payload(
-            x_widget,
-            y_widget,
-            frame_w,
-            frame_h,
+        point = (
+            self._widget_point_to_payload(
+                x_widget,
+                y_widget,
+                frame_w,
+                frame_h,
+            )
         )
 
         if point is None:
             self.status_label.setText(
-                "Click inside the actual video image"
+                "Click inside actual video image"
             )
             return
 
@@ -1334,12 +1426,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         print(
             f"[{action}] "
-            f"widget=({x_widget:.1f}, {y_widget:.1f}) "
-            f"Gremsy=({x_payload}, {y_payload})"
+            f"Gremsy=({x_payload}, "
+            f"{y_payload})"
         )
 
-        # Backend decides whether this means move-only or track,
-        # based on PAYLOAD_TRACK mode previously sent.
         ok, _ = self._send_remote_command(
             CMD_PAYLOAD_TOUCH,
             [
@@ -1352,16 +1442,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if self.tracking_enabled:
-            suffix = (
-                " | geolocation enabled"
-                if self.geolocation_available
-                else " | geolocation unavailable"
-            )
-
             self.status_label.setText(
                 f"Tracking target at "
                 f"({x_payload}, {y_payload})"
-                f"{suffix}"
             )
         else:
             self.status_label.setText(
@@ -1404,7 +1487,8 @@ class MainWindow(QtWidgets.QMainWindow):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Payload PyQt UI - click to point or click to track"
+            "Gremsy Lynx PyQt UI with "
+            "target geolocation estimator"
         )
     )
 
@@ -1415,33 +1499,27 @@ def parse_args() -> argparse.Namespace:
             "listen",
         ],
         default="connect",
-        help="Remote bridge role for this UI process",
     )
-
     parser.add_argument(
         "--remote-host",
         default=RemoteBridgeConfig.HOST,
     )
-
     parser.add_argument(
         "--remote-port",
         type=int,
         default=RemoteBridgeConfig.PORT,
     )
-
     parser.add_argument(
         "--remote-token",
         default=RemoteBridgeConfig.TOKEN,
     )
-
     parser.add_argument(
         "--geo-timeout",
         type=float,
         default=DEFAULT_GEO_TIMEOUT_S,
         help=(
-            "Seconds to wait for ArduPilot/GPS status after the "
-            "remote bridge connects. Geolocation is optional and "
-            "pointing/tracking continue after timeout."
+            "Seconds before unavailable "
+            "estimator state becomes a warning."
         ),
     )
 
