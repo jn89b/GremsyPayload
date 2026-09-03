@@ -323,11 +323,15 @@ dependencies = [
     { name = "mavproxy" },
     { name = "numpy" },
     { name = "opencv-python" },
-    { name = "pygobject" },
     { name = "pymavlink" },
     { name = "pyserial" },
     { name = "pyside6" },
     { name = "requests" },
+]
+
+[package.optional-dependencies]
+gst = [
+    { name = "pygobject" },
 ]
 
 [package.metadata]
@@ -335,13 +339,13 @@ requires-dist = [
     { name = "mavproxy", specifier = ">=1.8.74" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "opencv-python", specifier = ">=4.9.0" },
-    { name = "pygobject", marker = "python_full_version < '3.9'", specifier = ">=3.50.0" },
-    { name = "pygobject", marker = "python_full_version >= '3.9'", specifier = "==3.50.0" },
+    { name = "pygobject", marker = "extra == 'gst'", specifier = "==3.50.0" },
     { name = "pymavlink", specifier = ">=2.4.49" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "pyside6", specifier = ">=6.7.0" },
     { name = "requests", specifier = ">=2.34.2" },
 ]
+provides-extras = ["gst"]
 
 [[package]]
 name = "pycairo"
