@@ -44,7 +44,8 @@ Example:
         --camera-height-agl 2.0
 
 For flight over reasonably flat terrain you can omit --camera-height-agl.
-The estimator then falls back to GLOBAL_POSITION_INT.relative_alt.
+The estimator first uses GLOBAL_POSITION_INT.relative_alt and then falls back
+to GLOBAL_POSITION_INT.alt - HOME_POSITION.altitude.
 """
 
 import argparse
@@ -329,6 +330,11 @@ class RemoteExecutor:
         self._vehicle_relative_alt_m: Optional[
             float
         ] = None
+
+        # Home altitude (AMSL) is used as a flight fallback when
+        # GLOBAL_POSITION_INT.relative_alt is unavailable/zero.
+        self._home_alt_m: Optional[float] = None
+        self._last_home_request_mono = 0.0
 
         self._vehicle_roll_deg: Optional[
             float
@@ -895,6 +901,21 @@ class RemoteExecutor:
                     if msg_type == "HEARTBEAT":
                         with self._state_lock:
                             self._last_ap_heartbeat_mono = now
+
+                        # HOME_POSITION is not guaranteed to be streamed
+                        # continuously. Request it periodically until received.
+                        self._request_ardupilot_home_position(
+                            master,
+                            src_sysid,
+                            now,
+                        )
+                        continue
+
+                    if msg_type == "HOME_POSITION":
+                        self._handle_ardupilot_home_position(
+                            msg,
+                            now,
+                        )
                         continue
 
                     if msg_type == "ATTITUDE":
@@ -988,6 +1009,73 @@ class RemoteExecutor:
 
         return False
 
+    def _request_ardupilot_home_position(
+        self,
+        master,
+        src_sysid: int,
+        now: float,
+    ) -> None:
+        """Request HOME_POSITION until a valid home altitude is received."""
+        with self._state_lock:
+            home_alt_m = self._home_alt_m
+            last_request = self._last_home_request_mono
+
+        if home_alt_m is not None:
+            return
+
+        # Avoid sending a request on every heartbeat.
+        if last_request > 0.0 and now - last_request < 5.0:
+            return
+
+        try:
+            target_sysid = (
+                self._ap_target_sysid
+                if self._ap_target_sysid is not None
+                else src_sysid
+            )
+            master.mav.command_long_send(
+                int(target_sysid),
+                mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1,
+                mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                0,
+                mavutil.mavlink.MAVLINK_MSG_ID_HOME_POSITION,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+
+            with self._state_lock:
+                self._last_home_request_mono = now
+
+        except Exception as exc:
+            self._log(
+                f"unable to request HOME_POSITION: {exc}"
+            )
+
+    def _handle_ardupilot_home_position(
+        self,
+        msg,
+        now: float,
+    ) -> None:
+        """Store ArduPilot home altitude in meters AMSL."""
+        try:
+            home_alt_m = float(msg.altitude) / 1000.0
+        except Exception:
+            return
+
+        if not math.isfinite(home_alt_m):
+            return
+
+        with self._state_lock:
+            self._home_alt_m = home_alt_m
+
+        self._log(
+            f"ArduPilot HOME_POSITION altitude={home_alt_m:.2f} m AMSL"
+        )
+
     def _handle_ardupilot_attitude(
         self,
         msg,
@@ -1040,6 +1128,16 @@ class RemoteExecutor:
             self._vehicle_relative_alt_m = (
                 relative_alt_m
             )
+
+            # If relative_alt is valid, it also gives us a useful home-altitude
+            # estimate for fallback/debugging.
+            if (
+                math.isfinite(relative_alt_m)
+                and relative_alt_m > 0.05
+            ):
+                self._home_alt_m = (
+                    alt_m - relative_alt_m
+                )
 
         # Forward the vehicle position to Gremsy as well.
         if (
@@ -1249,6 +1347,7 @@ class RemoteExecutor:
         self,
         vehicle_alt_m: Optional[float],
         relative_alt_m: Optional[float],
+        home_alt_m: Optional[float],
     ) -> Tuple[Optional[float], Optional[float], str]:
         """
         Return:
@@ -1288,6 +1387,7 @@ class RemoteExecutor:
 
         if (
             relative_alt_m is not None
+            and math.isfinite(relative_alt_m)
             and relative_alt_m > 0.05
         ):
             ground_alt = (
@@ -1302,6 +1402,24 @@ class RemoteExecutor:
                 ground_alt,
                 "relative-alt",
             )
+
+        # Flight fallback: HOME_POSITION altitude is AMSL, so subtract it
+        # from GLOBAL_POSITION_INT.alt (also AMSL). This still assumes the
+        # target terrain is near the home elevation.
+        if (
+            vehicle_alt_m is not None
+            and home_alt_m is not None
+            and math.isfinite(vehicle_alt_m)
+            and math.isfinite(home_alt_m)
+        ):
+            height = vehicle_alt_m - home_alt_m
+
+            if height > 0.05:
+                return (
+                    height,
+                    home_alt_m,
+                    "msl-minus-home",
+                )
 
         return (
             None,
@@ -1385,6 +1503,7 @@ class RemoteExecutor:
             relative_alt_m = (
                 self._vehicle_relative_alt_m
             )
+            home_alt_m = self._home_alt_m
 
             vehicle_roll = self._vehicle_roll_deg
             vehicle_pitch = (
@@ -1511,6 +1630,7 @@ class RemoteExecutor:
             "vehicle_relative_alt_m": (
                 relative_alt_m
             ),
+            "home_alt_m": home_alt_m,
             "vehicle_roll_deg": vehicle_roll,
             "vehicle_pitch_deg": vehicle_pitch,
             "vehicle_yaw_deg": vehicle_yaw,
@@ -1654,6 +1774,7 @@ class RemoteExecutor:
             self._get_height_agl(
                 vehicle_alt_m,
                 relative_alt_m,
+                home_alt_m,
             )
         )
 
@@ -1663,9 +1784,28 @@ class RemoteExecutor:
         )
 
         if height_agl is None:
+            rel_text = (
+                "none"
+                if relative_alt_m is None
+                else f"{relative_alt_m:.2f} m"
+            )
+            home_text = (
+                "none"
+                if home_alt_m is None
+                else f"{home_alt_m:.2f} m"
+            )
+            alt_text = (
+                "none"
+                if vehicle_alt_m is None
+                else f"{vehicle_alt_m:.2f} m"
+            )
+
             result["estimate_reason"] = (
-                "No usable camera AGL. "
-                "For ground tests run executor with "
+                "No usable camera AGL "
+                f"(relative_alt={rel_text}, "
+                f"vehicle_alt={alt_text}, "
+                f"home_alt={home_text}). "
+                "For bench tests use "
                 "--camera-height-agl <meters>."
             )
             return result
@@ -2163,7 +2303,7 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help=(
             "Override camera height above target ground plane in meters. "
-            "Recommended for ground tests. 0 = use relative_alt."
+            "Recommended for ground tests. 0 = use relative_alt, then MSL-home fallback."
         ),
     )
     parser.add_argument(
