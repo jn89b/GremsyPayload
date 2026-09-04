@@ -147,6 +147,16 @@ Optional token:
 python remote_executor.py --role listen --host 0.0.0.0 --port 5000 --token my-shared-token
 ```
 
+To run the executor as a systemd service (starts on boot, restarts on crash):
+This installs the script with the default port (5000)
+
+```bash
+cd PayloadSdk
+./useful_scripts/install_gremsy_service.sh
+```
+
+Check it with `systemctl status gremsy` or `journalctl -u gremsy -f`.
+
 ### 2) Start UI on operator machine in remote mode
 
 ```bash
