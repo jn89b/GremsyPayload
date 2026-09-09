@@ -13,3 +13,4 @@ TARGET_SYSTEM = 1
 TARGET_COMPONENT = 101  # verify this on the Lynx check the website 
 
 ```
+- Once you run the script reboot the camera and you should see the camera project visual only.
