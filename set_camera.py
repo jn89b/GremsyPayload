@@ -11,7 +11,7 @@ import time
 GREMSY_IP = "192.168.1.240"
 GREMSY_PORT = 14566
 
-TARGET_SYSTEM = 1
+TARGET_SYSTEM = 104
 TARGET_COMPONENT = 101  # verify this on the Lynx
 
 gimbal = mavutil.mavlink_connection(
@@ -25,6 +25,10 @@ print(f"Connecting to Gremsy at {GREMSY_IP}:{GREMSY_PORT}")
 
 time.sleep(1)
 
+# ============================================================
+# Set main camera view to EO only
+# ============================================================
+
 print("Setting camera view to EO only...")
 
 gimbal.mav.param_ext_set_send(
@@ -36,3 +40,25 @@ gimbal.mav.param_ext_set_send(
 )
 
 print("C_SOURCE=1 sent")
+
+time.sleep(0.5)
+
+# ============================================================
+# Set IR palette to WhiteHot
+# ============================================================
+
+print("Setting IR palette to WhiteHot...")
+
+gimbal.mav.param_ext_set_send(
+    TARGET_SYSTEM,
+    TARGET_COMPONENT,
+    b"C_T_PALETTE",
+    b"0",  # 0 = WhiteHot
+    mavutil.mavlink.MAV_PARAM_EXT_TYPE_UINT32,
+)
+
+print("C_T_PALETTE=0 sent")
+
+time.sleep(1)
+
+print("Configuration complete.")
