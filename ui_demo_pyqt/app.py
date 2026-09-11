@@ -500,7 +500,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         default_rtsp_url = (
-            f"rtsp://{ConnectionConfig.UDP_IP_TARGET}:"
+            f"rtsp://{args.remote_host}:"
             f"{ConnectionConfig.RTSP_PORT_TARGET}/"
             f"{ConnectionConfig.RTSP_PATH_TARGET}"
         )
