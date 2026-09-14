@@ -62,6 +62,7 @@ CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
 CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
 CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
 CMD_PAYLOAD_CAMERA_PARAM = "PAYLOAD_CAMERA_PARAM"
+CMD_PAYLOAD_RECORD = "PAYLOAD_RECORD"
 
 # (label, payload param value)
 # ponytail: Lynx (Guide sensor) names; FLIR-sensor payloads map the same ids
@@ -473,6 +474,16 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
 
+        self.record_button = QtWidgets.QPushButton("Record")
+        self.record_button.setCheckable(True)
+        self.record_button.setToolTip(
+            "Record EO + IR to the camera's SD card. Stream is unaffected."
+        )
+        self.record_button.setStyleSheet(
+            "QPushButton:checked { background: #dc2626; color: white; }"
+        )
+        self.record_button.clicked.connect(self._on_record_clicked)
+
         self.status_label = QtWidgets.QLabel(
             "Ready"
         )
@@ -499,6 +510,8 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_row.addSpacing(24)
         controls_row.addWidget(QtWidgets.QLabel("IR Palette"))
         controls_row.addWidget(self.palette_combo)
+        controls_row.addSpacing(24)
+        controls_row.addWidget(self.record_button)
         controls_row.addStretch(1)
         controls_row.addWidget(
             self.status_label
@@ -659,6 +672,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "color: #94a3b8; font-weight: 600;"
         )
 
+    def _on_record_clicked(self, checked: bool) -> None:
+        ok, _ = self._send_remote_command(
+            CMD_PAYLOAD_RECORD, [1 if checked else 0]
+        )
+        if not ok:
+            self.record_button.setChecked(not checked)
+        self._set_record_ui(self.record_button.isChecked())
+
+    def _set_record_ui(self, recording: bool) -> None:
+        self.record_button.setChecked(recording)
+        self.record_button.setText("Stop Rec" if recording else "Record")
+
     def _send_remote_command(
         self,
         command: str,
@@ -816,6 +841,12 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = self.palette_combo.findData(palette)
             if idx >= 0:
                 self.palette_combo.setCurrentIndex(idx)
+
+        # Mirror camera-reported recording state (clicked() only fires on
+        # user clicks, so setChecked here never echoes a command).
+        recording = data.get("recording")
+        if recording is not None and bool(recording) != self.record_button.isChecked():
+            self._set_record_ui(bool(recording))
 
         ap_connected = bool(
             data.get(

@@ -72,7 +72,9 @@ try:
     from pymavlink import mavutil
     from payload_define import (
         PAYLOAD_CAMERA_IR_PALETTE,
+        PAYLOAD_CAMERA_RECORD_SRC,
         camera_zoom_value,
+        payload_camera_record_src,
     )
     from payload_sdk import (
         PayloadSdkInterface,
@@ -96,6 +98,7 @@ CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
 CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
 CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
 CMD_PAYLOAD_CAMERA_PARAM = "PAYLOAD_CAMERA_PARAM"
+CMD_PAYLOAD_RECORD = "PAYLOAD_RECORD"  # params: [1 start | 0 stop]
 
 # params: [name, int value]; allowlist of settable camera params
 CAMERA_PARAMS = {
@@ -241,6 +244,10 @@ class RemoteExecutor:
 
         # Last IR palette reported by the camera (None until it answers).
         self.ir_palette: Optional[int] = None
+
+        # Camera-reported video_status from CAMERA_CAPTURE_STATUS.
+        self.recording = False
+        self._record_armed = False
 
         # ------------------------- estimator config ---------------------
         self.camera_height_agl = max(
@@ -638,6 +645,14 @@ class RemoteExecutor:
         try:
             event_value = int(event)
             now = time.monotonic()
+
+            if event_value == int(
+                payload_status_event_t.PAYLOAD_CAM_CAPTURE_STATUS
+            ):
+                # param: [image_status, video_status, image_count, rec_ms]
+                if len(param) >= 2:
+                    self.recording = int(param[1]) != 0
+                return
 
             if (
                 event_value
@@ -1643,6 +1658,7 @@ class RemoteExecutor:
 
         result = {
             "ir_palette": self.ir_palette,
+            "recording": self.recording,
             "ardupilot_connected": (
                 ardupilot_connected
             ),
@@ -2233,6 +2249,33 @@ class RemoteExecutor:
                     self.ir_palette = value
 
                 return True, f"{name}={value}"
+
+            if command == CMD_PAYLOAD_RECORD:
+                start = int(params[0]) != 0
+                with self._sdk_send_lock:
+                    if start and not self._record_armed:
+                        # ponytail: video mode + EO/IR-to-card set once, on
+                        # first record, so a mode switch never hits the
+                        # stream mid-session. Stream source (C_SOURCE)
+                        # is untouched.
+                        self.sdk.setPayloadCameraMode(
+                            mavutil.mavlink.CAMERA_MODE_VIDEO
+                        )
+                        self.sdk.setPayloadCameraParam(
+                            PAYLOAD_CAMERA_RECORD_SRC,
+                            payload_camera_record_src.PAYLOAD_CAMERA_RECORD_BOTH,
+                            mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
+                        )
+                        self._record_armed = True
+                    if start:
+                        self.sdk.setPayloadCameraRecordVideoStart()
+                    else:
+                        self.sdk.setPayloadCameraRecordVideoStop()
+                    # Camera answers with CAMERA_CAPTURE_STATUS -> self.recording
+                    self.sdk.getPayloadCaptureStatus()
+
+                self.recording = start
+                return True, "recording started" if start else "recording stopped"
 
             return (
                 False,
