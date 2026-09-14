@@ -61,6 +61,23 @@ CMD_PAYLOAD_ZOOM_IN = "PAYLOAD_ZOOM_IN"
 CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
 CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
 CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
+CMD_PAYLOAD_CAMERA_PARAM = "PAYLOAD_CAMERA_PARAM"
+
+# (label, payload param value)
+# ponytail: Lynx (Guide sensor) names; FLIR-sensor payloads map the same ids
+# to different palettes (see payload_camera_ir_palette in libs/*_define.py).
+IR_PALETTES = [
+    ("WhiteHot", 0),
+    ("Fulgurite", 1),
+    ("IronRed", 2),
+    ("HotIron", 3),
+    ("Medical", 4),
+    ("Arctic", 5),
+    ("Rainbow1", 6),
+    ("Rainbow2", 7),
+    ("Tint", 8),
+    ("BlackHot", 9),
+]
 
 GREMSY_FRAME_W = 1920
 GREMSY_FRAME_H = 1080
@@ -445,6 +462,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._zoom_released
         )
 
+        self.palette_combo = QtWidgets.QComboBox()
+        self.palette_combo.setToolTip("IR color palette")
+        for label, value in IR_PALETTES:
+            self.palette_combo.addItem(label, value)
+        self.palette_combo.activated.connect(
+            lambda _i: self._send_remote_command(
+                CMD_PAYLOAD_CAMERA_PARAM,
+                ["ir_palette", self.palette_combo.currentData()],
+            )
+        )
+
         self.status_label = QtWidgets.QLabel(
             "Ready"
         )
@@ -468,6 +496,9 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_row.addWidget(
             self.zoom_in_button
         )
+        controls_row.addSpacing(24)
+        controls_row.addWidget(QtWidgets.QLabel("IR Palette"))
+        controls_row.addWidget(self.palette_combo)
         controls_row.addStretch(1)
         controls_row.addWidget(
             self.status_label
@@ -775,6 +806,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         data: Dict,
     ) -> None:
+        # Mirror the camera's IR palette; activated() only fires on user
+        # clicks, so this never echoes a command back.
+        palette = data.get("ir_palette")
+        if (
+            palette is not None
+            and palette != self.palette_combo.currentData()
+        ):
+            idx = self.palette_combo.findData(palette)
+            if idx >= 0:
+                self.palette_combo.setCurrentIndex(idx)
+
         ap_connected = bool(
             data.get(
                 "ardupilot_connected",

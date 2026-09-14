@@ -70,7 +70,10 @@ from remote_bridge import BridgeConfig, TcpCommandBridge
 
 try:
     from pymavlink import mavutil
-    from payload_define import camera_zoom_value
+    from payload_define import (
+        PAYLOAD_CAMERA_IR_PALETTE,
+        camera_zoom_value,
+    )
     from payload_sdk import (
         PayloadSdkInterface,
         camera_type_t,
@@ -92,6 +95,12 @@ CMD_PAYLOAD_ZOOM_IN = "PAYLOAD_ZOOM_IN"
 CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
 CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
 CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
+CMD_PAYLOAD_CAMERA_PARAM = "PAYLOAD_CAMERA_PARAM"
+
+# params: [name, int value]; allowlist of settable camera params
+CAMERA_PARAMS = {
+    "ir_palette": PAYLOAD_CAMERA_IR_PALETTE,
+}
 
 GREMSY_FRAME_W = 1920
 GREMSY_FRAME_H = 1080
@@ -229,6 +238,9 @@ class RemoteExecutor:
         # SDK writes can come from the command thread, MAVLink forwarding
         # thread, and FOV polling thread.
         self._sdk_send_lock = threading.Lock()
+
+        # Last IR palette reported by the camera (None until it answers).
+        self.ir_palette: Optional[int] = None
 
         # ------------------------- estimator config ---------------------
         self.camera_height_agl = max(
@@ -539,6 +551,12 @@ class RemoteExecutor:
             self._on_payload_param_changed
         )
 
+        # Ask once for the current IR palette so the UI can show it.
+        with self._sdk_send_lock:
+            self.sdk.getPayloadCameraSettingByID(
+                PAYLOAD_CAMERA_IR_PALETTE
+            )
+
         requested_params = [
             payload_param_t.PARAM_TRACK_POS_X,
             payload_param_t.PARAM_TRACK_POS_Y,
@@ -751,6 +769,18 @@ class RemoteExecutor:
         params: List[float],
     ) -> None:
         try:
+            if (
+                int(event)
+                == int(
+                    payload_status_event_t.PAYLOAD_CAM_PARAMS
+                )
+                and str(param_mode).rstrip("\x00")
+                == PAYLOAD_CAMERA_IR_PALETTE
+                and len(params) >= 2
+            ):
+                self.ir_palette = int(params[1])
+                return
+
             if (
                 int(event)
                 != int(
@@ -1612,6 +1642,7 @@ class RemoteExecutor:
             )
 
         result = {
+            "ir_palette": self.ir_palette,
             "ardupilot_connected": (
                 ardupilot_connected
             ),
@@ -2185,6 +2216,23 @@ class RemoteExecutor:
                     )
 
                 return True, "zoom stopped"
+
+            if command == CMD_PAYLOAD_CAMERA_PARAM:
+                name = str(params[0])
+                value = int(params[1])
+                param_id = CAMERA_PARAMS[name]
+
+                with self._sdk_send_lock:
+                    self.sdk.setPayloadCameraParam(
+                        param_id,
+                        value,
+                        mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
+                    )
+
+                if name == "ir_palette":
+                    self.ir_palette = value
+
+                return True, f"{name}={value}"
 
             return (
                 False,
