@@ -30,6 +30,7 @@ class RtspVideoWidget(QtWidgets.QLabel):
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.timeout.connect(self._draw_latest_frame)
 
+
     def start_stream(self, rtsp_url: str) -> bool:
         """Start frame reader thread for RTSP URL."""
         self.stop_stream()
@@ -53,6 +54,7 @@ class RtspVideoWidget(QtWidgets.QLabel):
         self._reader_thread.start()
         self._poll_timer.start(33)
         return True
+
 
     def stop_stream(self) -> None:
         """Stop stream and release resources."""
