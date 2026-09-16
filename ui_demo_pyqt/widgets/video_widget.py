@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """PyQt video widget backed by OpenCV for RTSP display and click callbacks."""
 
+import os
 import threading
 import time
 from typing import Callable, Optional, Tuple
@@ -33,10 +34,18 @@ class RtspVideoWidget(QtWidgets.QLabel):
         """Start frame reader thread for RTSP URL."""
         self.stop_stream()
 
-        cap = cv2.VideoCapture(rtsp_url)
+        # ponytail: FFmpeg low-latency flags; must be set before VideoCapture is created
+        os.environ.setdefault(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0",
+        )
+
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             self.setText("Failed to open RTSP stream")
             return False
+
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self._capture = cap
         self._running = True

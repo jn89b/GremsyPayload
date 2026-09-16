@@ -203,7 +203,7 @@ class TcpCommandBridge:
                 continue
             except Exception as exc:
                 self._log(f"serve loop error={exc}")
-                self._drop_connection()
+                self._drop_connection(conn)
 
     def _safe_reply(self, conn: socket.socket, msg_id: str, ok: bool, detail: str) -> None:
         frame = {
@@ -255,23 +255,32 @@ class TcpCommandBridge:
             self._server_sock.settimeout(1.0)
             self._log(f"bridge listening on {self.cfg.host}:{self.cfg.port}")
 
-        if self.is_connected():
-            return
-
+        # ponytail: newest peer wins. Always accept so a half-open stale
+        # peer (no FIN, no keepalive) can't hold the single slot forever
+        # and fill the listen backlog, which makes new connects time out.
         try:
             conn, addr = self._server_sock.accept()
             conn.settimeout(None)
             with self._conn_lock:
+                old = self._conn
                 self._conn = conn
                 self._conn_ready.set()
+            if old is not None:
+                try:
+                    old.close()
+                except OSError:
+                    pass
+                self._log("bridge replaced stale peer")
             self._log(f"bridge accepted peer={addr[0]}:{addr[1]}")
         except socket.timeout:
             return
         except Exception as exc:
             self._log(f"bridge listen accept failed error={exc}")
 
-    def _drop_connection(self) -> None:
+    def _drop_connection(self, conn: Optional[socket.socket] = None) -> None:
         with self._conn_lock:
+            if conn is not None and self._conn is not conn:
+                return  # already replaced by a newer peer
             if self._conn:
                 try:
                     self._conn.close()

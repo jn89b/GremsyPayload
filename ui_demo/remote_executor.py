@@ -71,12 +71,16 @@ from remote_bridge import BridgeConfig, TcpCommandBridge
 try:
     from pymavlink import mavutil
     from payload_define import (
+        PAYLOAD_CAMERA_GIMBAL_MODE,
         PAYLOAD_CAMERA_IR_PALETTE,
+        PAYLOAD_CAMERA_RECORD_SRC,
         camera_zoom_value,
+        payload_camera_record_src,
     )
     from payload_sdk import (
         PayloadSdkInterface,
         camera_type_t,
+        input_mode_t,
         mavlink_global_position_int_t,
         mavlink_gps_raw_int_t,
         payload_param_t,
@@ -96,6 +100,11 @@ CMD_PAYLOAD_ZOOM_OUT = "PAYLOAD_ZOOM_OUT"
 CMD_PAYLOAD_ZOOM_STOP = "PAYLOAD_ZOOM_STOP"
 CMD_GET_GEO_STATUS = "GET_GEO_STATUS"
 CMD_PAYLOAD_CAMERA_PARAM = "PAYLOAD_CAMERA_PARAM"
+CMD_PAYLOAD_RECORD = "PAYLOAD_RECORD"  # params: [1 start | 0 stop]
+# params: [GB_MODE int]; 0 off, 1 lock, 2 follow, 3 mapping, 4 reset (recenter)
+CMD_PAYLOAD_GIMBAL_MODE = "PAYLOAD_GIMBAL_MODE"
+# no params; angle command roll=0 keeping current pitch/yaw
+CMD_PAYLOAD_GIMBAL_LEVEL_ROLL = "PAYLOAD_GIMBAL_LEVEL_ROLL"
 
 # params: [name, int value]; allowlist of settable camera params
 CAMERA_PARAMS = {
@@ -241,6 +250,10 @@ class RemoteExecutor:
 
         # Last IR palette reported by the camera (None until it answers).
         self.ir_palette: Optional[int] = None
+
+        # Camera-reported video_status from CAMERA_CAPTURE_STATUS.
+        self.recording = False
+        self._record_armed = False
 
         # ------------------------- estimator config ---------------------
         self.camera_height_agl = max(
@@ -638,6 +651,14 @@ class RemoteExecutor:
         try:
             event_value = int(event)
             now = time.monotonic()
+
+            if event_value == int(
+                payload_status_event_t.PAYLOAD_CAM_CAPTURE_STATUS
+            ):
+                # param: [image_status, video_status, image_count, rec_ms]
+                if len(param) >= 2:
+                    self.recording = int(param[1]) != 0
+                return
 
             if (
                 event_value
@@ -1643,6 +1664,7 @@ class RemoteExecutor:
 
         result = {
             "ir_palette": self.ir_palette,
+            "recording": self.recording,
             "ardupilot_connected": (
                 ardupilot_connected
             ),
@@ -2233,6 +2255,58 @@ class RemoteExecutor:
                     self.ir_palette = value
 
                 return True, f"{name}={value}"
+
+            if command == CMD_PAYLOAD_RECORD:
+                start = int(params[0]) != 0
+                with self._sdk_send_lock:
+                    if start and not self._record_armed:
+                        # ponytail: video mode + EO/IR-to-card set once, on
+                        # first record, so a mode switch never hits the
+                        # stream mid-session. Stream source (C_SOURCE)
+                        # is untouched.
+                        self.sdk.setPayloadCameraMode(
+                            mavutil.mavlink.CAMERA_MODE_VIDEO
+                        )
+                        self.sdk.setPayloadCameraParam(
+                            PAYLOAD_CAMERA_RECORD_SRC,
+                            payload_camera_record_src.PAYLOAD_CAMERA_RECORD_BOTH,
+                            mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
+                        )
+                        self._record_armed = True
+                    if start:
+                        self.sdk.setPayloadCameraRecordVideoStart()
+                    else:
+                        self.sdk.setPayloadCameraRecordVideoStop()
+                    # Camera answers with CAMERA_CAPTURE_STATUS -> self.recording
+                    self.sdk.getPayloadCaptureStatus()
+
+                self.recording = start
+                return True, "recording started" if start else "recording stopped"
+
+            if command == CMD_PAYLOAD_GIMBAL_MODE:
+                mode = int(params[0])
+                with self._sdk_send_lock:
+                    self.sdk.setPayloadCameraParam(
+                        PAYLOAD_CAMERA_GIMBAL_MODE,
+                        mode,
+                        mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
+                    )
+                return True, f"gimbal mode {mode}"
+
+            if command == CMD_PAYLOAD_GIMBAL_LEVEL_ROLL:
+                with self._state_lock:
+                    pitch = self._gimbal_pitch_deg
+                    yaw = self._gimbal_yaw_deg
+                if pitch is None or yaw is None:
+                    return False, "no gimbal attitude yet"
+                # ponytail: only helps when the gimbal *reports* the roll
+                # (commanded/mechanical). IMU horizon drift reads ~0 and
+                # needs gyro calib / vehicle attitude feed instead.
+                with self._sdk_send_lock:
+                    self.sdk.setGimbalSpeed(
+                        pitch, 0.0, yaw, input_mode_t.INPUT_ANGLE
+                    )
+                return True, f"roll->0 (pitch={pitch:.1f} yaw={yaw:.1f})"
 
             return (
                 False,
