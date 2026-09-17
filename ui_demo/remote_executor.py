@@ -109,6 +109,9 @@ CMD_PAYLOAD_GIMBAL_LEVEL_ROLL = "PAYLOAD_GIMBAL_LEVEL_ROLL"
 # params: [heading_deg]; yaw the gimbal to an absolute compass heading,
 # keeping current pitch, roll=0
 CMD_PAYLOAD_GIMBAL_YAW_HEADING = "PAYLOAD_GIMBAL_YAW_HEADING"
+# params: [1 on | 0 off]; keep re-commanding the last clicked heading as
+# the vehicle yaws
+CMD_PAYLOAD_GIMBAL_HEADING_HOLD = "PAYLOAD_GIMBAL_HEADING_HOLD"
 
 # params: [name, int value]; allowlist of settable camera params
 CAMERA_PARAMS = {
@@ -165,6 +168,54 @@ def ir_px_to_eo_px(
 
 def _wrap_360(angle_deg: float) -> float:
     return angle_deg % 360.0
+
+
+def _wrap_180(angle_deg: float) -> float:
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+# ponytail: Gremsy yaw motor mechanical range, tune per gimbal model.
+GIMBAL_YAW_LIMIT_DEG = 170.0
+
+
+def heading_to_gimbal_yaw(
+    heading_deg: float,
+    vehicle_yaw_deg: float,
+    yaw_offset_deg: float,
+    frame: str,
+    limit_deg: float = GIMBAL_YAW_LIMIT_DEG,
+) -> Tuple[float, float, bool]:
+    """Compass heading -> gimbal yaw setpoint, kept inside the motor range.
+
+    Returns (yaw_cmd, body_yaw, clamped). body_yaw is the yaw relative to
+    the aircraft nose; that is what the mechanical +-limit applies to, in
+    every frame. yaw_cmd is body_yaw for a vehicle-frame gimbal, or
+    body_yaw + vehicle heading for an earth-frame one. Inverse of
+    _resolve_camera_attitude_ned.
+    """
+    body = _wrap_180(heading_deg - yaw_offset_deg - vehicle_yaw_deg)
+    clamped = abs(body) > limit_deg
+    if clamped:
+        body = math.copysign(limit_deg, body)
+    cmd = body if frame != "earth" else _wrap_180(body + vehicle_yaw_deg)
+    return cmd, body, clamped
+
+
+def _body_to_cmd(body_deg: float, vehicle_yaw_deg: float, frame: str) -> float:
+    return body_deg if frame != "earth" else _wrap_180(body_deg + vehicle_yaw_deg)
+
+
+def yaw_path(cur_body_deg: float, tgt_body_deg: float) -> List[float]:
+    """Body-yaw waypoints from cur to tgt that never cross the rear stop.
+
+    The firmware takes the shortest arc. When that arc passes +-180 the
+    only way round is a stop at the nose first.
+    """
+    crosses_rear = (
+        cur_body_deg * tgt_body_deg < 0
+        and abs(cur_body_deg) + abs(tgt_body_deg) > 180.0
+    )
+    return [0.0, tgt_body_deg] if crosses_rear else [tgt_body_deg]
 
 
 def _matmul3(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]):
@@ -433,6 +484,11 @@ class RemoteExecutor:
         self._gimbal_mode = ""
         self._gimbal_flags = 0
         self._gimbal_frame = "unknown"
+        # Bumped per compass click; a queued via-nose leg checks it.
+        self._yaw_seq = 0
+        self._hold_on = False
+        self._hold_heading_deg: Optional[float] = None
+        self._hold_last_cmd: Optional[float] = None
         self._last_gimbal_mono = 0.0
 
         # Tracker
@@ -1215,6 +1271,10 @@ class RemoteExecutor:
                 )
             )
             self._last_ap_attitude_mono = now
+            hold = self._hold_on
+            heading = self._hold_heading_deg
+        if hold and heading is not None:
+            self._yaw_to_heading(heading, only_if_changed=True)
 
     def _handle_ardupilot_global_position(
         self,
@@ -1729,6 +1789,8 @@ class RemoteExecutor:
         result = {
             "ir_palette": self.ir_palette,
             "recording": self.recording,
+            "heading_hold_on": self._hold_on,
+            "heading_hold_deg": self._hold_heading_deg,
             "ardupilot_connected": (
                 ardupilot_connected
             ),
@@ -2395,6 +2457,8 @@ class RemoteExecutor:
 
             if command == CMD_PAYLOAD_GIMBAL_MODE:
                 mode = int(params[0])
+                with self._state_lock:
+                    self._hold_on = False
                 with self._sdk_send_lock:
                     self.sdk.setPayloadCameraParam(
                         PAYLOAD_CAMERA_GIMBAL_MODE,
@@ -2421,25 +2485,30 @@ class RemoteExecutor:
             if command == CMD_PAYLOAD_GIMBAL_YAW_HEADING:
                 heading = float(params[0])
                 with self._state_lock:
-                    pitch = self._gimbal_pitch_deg
-                    frame = self._gimbal_frame
-                    vehicle_yaw = self._vehicle_yaw_deg
-                if pitch is None:
-                    return False, "no gimbal attitude yet"
-                # Inverse of _resolve_camera_attitude_ned: undo the camera
-                # yaw offset, then vehicle yaw when the gimbal reports in
-                # vehicle frame.
-                yaw = heading - self.camera_yaw_offset_deg
-                if frame != "earth":
-                    if vehicle_yaw is None:
-                        return False, "no vehicle yaw yet"
-                    yaw -= vehicle_yaw
-                yaw = (yaw + 180.0) % 360.0 - 180.0
+                    self._hold_heading_deg = heading
+                return self._yaw_to_heading(heading)
+
+            if command == CMD_PAYLOAD_GIMBAL_HEADING_HOLD:
+                on = bool(int(params[0]))
+                with self._state_lock:
+                    self._hold_on = on
+                    self._hold_last_cmd = None
+                    heading = self._hold_heading_deg
+                if not on:
+                    return True, "heading hold off"
+                # Follow mode: gimbal yaw is nose-relative, so the hold loop
+                # (driven by autopilot heading) is the thing keeping it on
+                # heading. In lock mode the gimbal's own IMU north wins and
+                # the executor cannot correct it.
                 with self._sdk_send_lock:
-                    self.sdk.setGimbalSpeed(
-                        pitch, 0.0, yaw, input_mode_t.INPUT_ANGLE
+                    self.sdk.setPayloadCameraParam(
+                        PAYLOAD_CAMERA_GIMBAL_MODE,
+                        2,
+                        mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
                     )
-                return True, f"heading {heading:.0f} -> yaw {yaw:.1f} ({frame})"
+                if heading is None:
+                    return True, "heading hold on, click a heading"
+                return self._yaw_to_heading(heading)
 
             return (
                 False,
@@ -2451,6 +2520,91 @@ class RemoteExecutor:
                 False,
                 f"execution error: {exc}",
             )
+
+    def _yaw_to_heading(
+        self, heading: float, only_if_changed: bool = False
+    ) -> Tuple[bool, str]:
+        """Yaw the gimbal to a compass heading, keeping pitch, roll=0.
+
+        only_if_changed: skip the send unless the setpoint moved >2 deg
+        since the last one (the heading-hold loop calls this on every
+        ATTITUDE message).
+        """
+        with self._state_lock:
+            pitch = self._gimbal_pitch_deg
+            cur_yaw = self._gimbal_yaw_deg
+            frame = self._gimbal_frame
+            vehicle_yaw = self._vehicle_yaw_deg
+            last_cmd = self._hold_last_cmd
+        if pitch is None or cur_yaw is None:
+            return False, "no gimbal attitude yet"
+        # Vehicle yaw is needed in every frame: the +-limit is on
+        # the yaw relative to the nose.
+        if vehicle_yaw is None:
+            return False, "no vehicle yaw yet"
+        yaw, body, clamped = heading_to_gimbal_yaw(
+            heading, vehicle_yaw, self.camera_yaw_offset_deg, frame
+        )
+        if (
+            only_if_changed
+            and last_cmd is not None
+            and abs(_wrap_180(yaw - last_cmd)) < 2.0
+        ):
+            return True, "unchanged"
+        with self._state_lock:
+            self._hold_last_cmd = yaw
+            self._yaw_seq += 1
+            seq = self._yaw_seq
+        cur_body = _wrap_180(
+            cur_yaw - (vehicle_yaw if frame == "earth" else 0.0)
+        )
+        path = yaw_path(cur_body, body)
+        first = _body_to_cmd(path[0], vehicle_yaw, frame)
+        with self._sdk_send_lock:
+            self.sdk.setGimbalSpeed(
+                pitch, 0.0, first, input_mode_t.INPUT_ANGLE
+            )
+        if len(path) > 1:
+            threading.Thread(
+                target=self._finish_yaw_via_nose,
+                args=(seq, pitch, body),
+                daemon=True,
+            ).start()
+        note = (
+            f", clamped to {body:+.0f} of nose" if clamped else ""
+        ) + (", via nose" if len(path) > 1 else "")
+        return True, f"heading {heading:.0f} -> yaw {yaw:.1f} ({frame}{note})"
+
+    def _finish_yaw_via_nose(
+        self, seq: int, pitch: float, tgt_body: float
+    ) -> None:
+        """Second leg of a compass click that had to go round the front."""
+        # ponytail: poll reported yaw; 6 s covers 170 deg at slow gimbal rates.
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            with self._state_lock:
+                if seq != self._yaw_seq:
+                    return  # newer click took over
+                gy = self._gimbal_yaw_deg
+                vy = self._vehicle_yaw_deg
+                frame = self._gimbal_frame
+            if gy is None or vy is None:
+                continue
+            cur_body = _wrap_180(gy - (vy if frame == "earth" else 0.0))
+            if abs(cur_body) < 15.0:
+                break
+        else:
+            self._log("yaw via nose: timed out waiting at nose, sending anyway")
+        with self._state_lock:
+            if seq != self._yaw_seq:
+                return
+            vy = self._vehicle_yaw_deg
+            frame = self._gimbal_frame
+        cmd = _body_to_cmd(tgt_body, vy or 0.0, frame)
+        with self._sdk_send_lock:
+            self.sdk.setGimbalSpeed(pitch, 0.0, cmd, input_mode_t.INPUT_ANGLE)
+        self._log(f"yaw via nose: final body {tgt_body:+.0f} -> cmd {cmd:.1f}")
 
     @staticmethod
     def _log(message: str) -> None:

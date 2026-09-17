@@ -86,6 +86,7 @@ CMD_PAYLOAD_RECORD = "PAYLOAD_RECORD"
 CMD_PAYLOAD_GIMBAL_MODE = "PAYLOAD_GIMBAL_MODE"
 CMD_PAYLOAD_GIMBAL_LEVEL_ROLL = "PAYLOAD_GIMBAL_LEVEL_ROLL"
 CMD_PAYLOAD_GIMBAL_YAW_HEADING = "PAYLOAD_GIMBAL_YAW_HEADING"
+CMD_PAYLOAD_GIMBAL_HEADING_HOLD = "PAYLOAD_GIMBAL_HEADING_HOLD"
 
 GIMBAL_MODE_RESET = 4
 
@@ -579,6 +580,21 @@ class MainWindow(QtWidgets.QMainWindow):
         geo_grid.addWidget(
             self.north_up_button,
             6, 4,
+            QtCore.Qt.AlignmentFlag.AlignHCenter,
+        )
+        self.hold_heading_checkbox = QtWidgets.QCheckBox("Hold heading")
+        self.hold_heading_checkbox.setToolTip(
+            "Keep the gimbal on the clicked compass heading as the aircraft yaws.\n"
+            "Reset Gimbal turns it off."
+        )
+        self.hold_heading_checkbox.toggled.connect(
+            lambda on: self._send_remote_command(
+                CMD_PAYLOAD_GIMBAL_HEADING_HOLD, [1 if on else 0]
+            )
+        )
+        geo_grid.addWidget(
+            self.hold_heading_checkbox,
+            7, 4,
             QtCore.Qt.AlignmentFlag.AlignHCenter,
         )
         geo_grid.setColumnStretch(3, 1)
@@ -1094,6 +1110,13 @@ class MainWindow(QtWidgets.QMainWindow):
         recording = data.get("recording")
         if recording is not None and bool(recording) != self.record_button.isChecked():
             self._set_record_ui(bool(recording))
+
+        # Mirror executor hold state (Reset Gimbal clears it there).
+        hold = data.get("heading_hold_on")
+        if hold is not None and bool(hold) != self.hold_heading_checkbox.isChecked():
+            self.hold_heading_checkbox.blockSignals(True)
+            self.hold_heading_checkbox.setChecked(bool(hold))
+            self.hold_heading_checkbox.blockSignals(False)
 
         ap_connected = bool(
             data.get(
