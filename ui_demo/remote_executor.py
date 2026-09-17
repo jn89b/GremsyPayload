@@ -73,6 +73,7 @@ try:
     from payload_define import (
         PAYLOAD_CAMERA_GIMBAL_MODE,
         PAYLOAD_CAMERA_IR_PALETTE,
+        PAYLOAD_CAMERA_IR_ZOOM_FACTOR,
         PAYLOAD_CAMERA_RECORD_SRC,
         camera_zoom_value,
         payload_camera_record_src,
@@ -105,6 +106,9 @@ CMD_PAYLOAD_RECORD = "PAYLOAD_RECORD"  # params: [1 start | 0 stop]
 CMD_PAYLOAD_GIMBAL_MODE = "PAYLOAD_GIMBAL_MODE"
 # no params; angle command roll=0 keeping current pitch/yaw
 CMD_PAYLOAD_GIMBAL_LEVEL_ROLL = "PAYLOAD_GIMBAL_LEVEL_ROLL"
+# params: [heading_deg]; yaw the gimbal to an absolute compass heading,
+# keeping current pitch, roll=0
+CMD_PAYLOAD_GIMBAL_YAW_HEADING = "PAYLOAD_GIMBAL_YAW_HEADING"
 
 # params: [name, int value]; allowlist of settable camera params
 CAMERA_PARAMS = {
@@ -125,6 +129,38 @@ EARTH_RADIUS_M = 6378137.0
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def ir_px_to_eo_px(
+    x: float,
+    y: float,
+    ir_hfov: float,
+    ir_vfov: float,
+    eo_hfov: float,
+    eo_vfov: float,
+) -> Tuple[int, int, bool]:
+    """Map a click on the IR image (normalized to the 1920x1080 frame) to the
+    EO pixel that looks at the same direction. Returns (x, y, inside) where
+    inside is False if the point fell outside the EO FOV before clamping.
+    # ponytail: assumes co-boresighted sensors, no lens distortion.
+    """
+
+    def remap(px: float, size: int, ir_fov: float, eo_fov: float) -> float:
+        u = px / size - 0.5
+        tan_ir = math.tan(math.radians(ir_fov) / 2.0)
+        tan_eo = math.tan(math.radians(eo_fov) / 2.0)
+        return size * (0.5 + u * tan_ir / tan_eo)
+
+    x_eo = remap(x, GREMSY_FRAME_W, ir_hfov, eo_hfov)
+    y_eo = remap(y, GREMSY_FRAME_H, ir_vfov, eo_vfov)
+    inside = (
+        0 <= x_eo < GREMSY_FRAME_W and 0 <= y_eo < GREMSY_FRAME_H
+    )
+    return (
+        int(round(_clamp(x_eo, 0, GREMSY_FRAME_W - 1))),
+        int(round(_clamp(y_eo, 0, GREMSY_FRAME_H - 1))),
+        inside,
+    )
 
 
 def _wrap_360(angle_deg: float) -> float:
@@ -217,6 +253,8 @@ class RemoteExecutor:
         max_ground_range_m: float,
         fallback_hfov_deg: float,
         fallback_vfov_deg: float,
+        ir_hfov_deg: float,
+        ir_vfov_deg: float,
         camera_roll_offset_deg: float,
         camera_pitch_offset_deg: float,
         camera_yaw_offset_deg: float,
@@ -250,6 +288,8 @@ class RemoteExecutor:
 
         # Last IR palette reported by the camera (None until it answers).
         self.ir_palette: Optional[int] = None
+        # Last IR zoom level (C_T_ZOOM index 0..7 = 1x..8x, None until known).
+        self.ir_zoom: Optional[int] = None
 
         # Camera-reported video_status from CAMERA_CAPTURE_STATUS.
         self.recording = False
@@ -281,6 +321,15 @@ class RemoteExecutor:
         self.fallback_vfov_deg = max(
             1.0,
             min(179.0, float(fallback_vfov_deg)),
+        )
+        # Native (1x) IR FOV; the zoomed FOV is derived from ir_zoom.
+        self.ir_hfov_deg = max(
+            1.0,
+            min(179.0, float(ir_hfov_deg)),
+        )
+        self.ir_vfov_deg = max(
+            1.0,
+            min(179.0, float(ir_vfov_deg)),
         )
 
         self.camera_roll_offset_deg = float(
@@ -564,10 +613,13 @@ class RemoteExecutor:
             self._on_payload_param_changed
         )
 
-        # Ask once for the current IR palette so the UI can show it.
+        # Ask once for the current IR palette and zoom so the UI can show them.
         with self._sdk_send_lock:
             self.sdk.getPayloadCameraSettingByID(
                 PAYLOAD_CAMERA_IR_PALETTE
+            )
+            self.sdk.getPayloadCameraSettingByID(
+                PAYLOAD_CAMERA_IR_ZOOM_FACTOR
             )
 
         requested_params = [
@@ -800,6 +852,18 @@ class RemoteExecutor:
                 and len(params) >= 2
             ):
                 self.ir_palette = int(params[1])
+                return
+
+            if (
+                int(event)
+                == int(
+                    payload_status_event_t.PAYLOAD_CAM_PARAMS
+                )
+                and str(param_mode).rstrip("\x00")
+                == PAYLOAD_CAMERA_IR_ZOOM_FACTOR
+                and len(params) >= 2
+            ):
+                self.ir_zoom = int(params[1])
                 return
 
             if (
@@ -2154,6 +2218,34 @@ class RemoteExecutor:
                     else GREMSY_FRAME_H // 2
                 )
 
+                # Click came from the IR image: convert to the EO pixel
+                # looking the same way, since EagleEyes works in EO frame.
+                hint = ""
+                if len(params) > 2 and params[2] == "ir":
+                    with self._state_lock:
+                        eo_h = self._hfov_deg or self.fallback_hfov_deg
+                        eo_v = self._vfov_deg or self.fallback_vfov_deg
+                    n = (self.ir_zoom or 0) + 1
+                    ir_h = 2.0 * math.degrees(math.atan(
+                        math.tan(math.radians(self.ir_hfov_deg) / 2.0) / n
+                    ))
+                    ir_v = 2.0 * math.degrees(math.atan(
+                        math.tan(math.radians(self.ir_vfov_deg) / 2.0) / n
+                    ))
+                    x_ir, y_ir = x, y
+                    x, y, inside = ir_px_to_eo_px(
+                        x, y, ir_h, ir_v, eo_h, eo_v
+                    )
+                    self._log(
+                        f"ir->eo remap ({x_ir},{y_ir}) -> ({x},{y}) "
+                        f"ir_fov={ir_h:.1f}x{ir_v:.1f} "
+                        f"eo_fov={eo_h:.1f}x{eo_v:.1f} inside={inside}"
+                    )
+                    if not inside:
+                        hint = (
+                            " (outside EO FOV; click again or zoom EO out)"
+                        )
+
                 x = max(
                     0,
                     min(
@@ -2192,7 +2284,8 @@ class RemoteExecutor:
                         True,
                         f"tracking acquisition sent "
                         f"x={x} y={y} "
-                        f"box={self.track_box}x{self.track_box}",
+                        f"box={self.track_box}x{self.track_box}"
+                        f"{hint}",
                     )
 
                 with self._sdk_send_lock:
@@ -2209,8 +2302,25 @@ class RemoteExecutor:
                 return (
                     True,
                     f"camera point command sent "
-                    f"x={x} y={y}",
+                    f"x={x} y={y}{hint}",
                 )
+
+            if (
+                command in (CMD_PAYLOAD_ZOOM_IN, CMD_PAYLOAD_ZOOM_OUT)
+                and params
+                and params[0] == "ir"
+            ):
+                # IR zoom is a discrete 1x..8x setting; one press = one step.
+                step = 1 if command == CMD_PAYLOAD_ZOOM_IN else -1
+                level = int(_clamp((self.ir_zoom or 0) + step, 0, 7))
+                with self._sdk_send_lock:
+                    self.sdk.setPayloadCameraParam(
+                        PAYLOAD_CAMERA_IR_ZOOM_FACTOR,
+                        level,
+                        mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
+                    )
+                self.ir_zoom = level
+                return True, f"ir zoom {level + 1}x"
 
             if command == CMD_PAYLOAD_ZOOM_IN:
                 with self._sdk_send_lock:
@@ -2307,6 +2417,29 @@ class RemoteExecutor:
                         pitch, 0.0, yaw, input_mode_t.INPUT_ANGLE
                     )
                 return True, f"roll->0 (pitch={pitch:.1f} yaw={yaw:.1f})"
+
+            if command == CMD_PAYLOAD_GIMBAL_YAW_HEADING:
+                heading = float(params[0])
+                with self._state_lock:
+                    pitch = self._gimbal_pitch_deg
+                    frame = self._gimbal_frame
+                    vehicle_yaw = self._vehicle_yaw_deg
+                if pitch is None:
+                    return False, "no gimbal attitude yet"
+                # Inverse of _resolve_camera_attitude_ned: undo the camera
+                # yaw offset, then vehicle yaw when the gimbal reports in
+                # vehicle frame.
+                yaw = heading - self.camera_yaw_offset_deg
+                if frame != "earth":
+                    if vehicle_yaw is None:
+                        return False, "no vehicle yaw yet"
+                    yaw -= vehicle_yaw
+                yaw = (yaw + 180.0) % 360.0 - 180.0
+                with self._sdk_send_lock:
+                    self.sdk.setGimbalSpeed(
+                        pitch, 0.0, yaw, input_mode_t.INPUT_ANGLE
+                    )
+                return True, f"heading {heading:.0f} -> yaw {yaw:.1f} ({frame})"
 
             return (
                 False,
@@ -2467,6 +2600,20 @@ def parse_args() -> argparse.Namespace:
             "Used only until Lynx CAMERA_FOV_STATUS is received."
         ),
     )
+    # ponytail: placeholder IR FOV, calibrate on hardware with
+    # examples/payload_get_fov_status.py at IR 1x and update these defaults.
+    parser.add_argument(
+        "--ir-hfov-deg",
+        type=float,
+        default=32.0,
+        help="Native (1x) IR horizontal FOV; used to remap IR clicks.",
+    )
+    parser.add_argument(
+        "--ir-vfov-deg",
+        type=float,
+        default=26.0,
+        help="Native (1x) IR vertical FOV; used to remap IR clicks.",
+    )
 
     parser.add_argument(
         "--camera-roll-offset-deg",
@@ -2535,6 +2682,8 @@ def main() -> int:
         fallback_vfov_deg=(
             args.fallback_vfov_deg
         ),
+        ir_hfov_deg=args.ir_hfov_deg,
+        ir_vfov_deg=args.ir_vfov_deg,
         camera_roll_offset_deg=(
             args.camera_roll_offset_deg
         ),

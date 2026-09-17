@@ -54,6 +54,26 @@ from config import ConnectionConfig, RemoteBridgeConfig
 from remote_bridge import BridgeConfig, TcpCommandBridge
 from widgets.video_widget import RtspVideoWidget
 
+try:
+    import mgrs as _mgrs_lib
+
+    _MGRS = _mgrs_lib.MGRS()
+except ImportError:  # ponytail: optional dep, UI still runs without it
+    _MGRS = None
+
+
+def to_mgrs(lat: float, lon: float) -> str:
+    """Lat/lon (deg) -> MGRS string at 1 m precision, or a short reason."""
+    if _MGRS is None:
+        return "MGRS n/a (pip install mgrs)"
+    try:
+        out = _MGRS.toMGRS(lat, lon, MGRSPrecision=5)
+        out = out.decode() if isinstance(out, bytes) else out
+        return f"{out[:3]} {out[3:5]} {out[5:10]} {out[10:]}"
+
+    except Exception:  # polar/invalid coords
+        return "MGRS n/a"
+
 
 CMD_PAYLOAD_TOUCH = "PAYLOAD_TOUCH"
 CMD_PAYLOAD_TRACK = "PAYLOAD_TRACK"
@@ -65,6 +85,7 @@ CMD_PAYLOAD_CAMERA_PARAM = "PAYLOAD_CAMERA_PARAM"
 CMD_PAYLOAD_RECORD = "PAYLOAD_RECORD"
 CMD_PAYLOAD_GIMBAL_MODE = "PAYLOAD_GIMBAL_MODE"
 CMD_PAYLOAD_GIMBAL_LEVEL_ROLL = "PAYLOAD_GIMBAL_LEVEL_ROLL"
+CMD_PAYLOAD_GIMBAL_YAW_HEADING = "PAYLOAD_GIMBAL_YAW_HEADING"
 
 GIMBAL_MODE_RESET = 4
 
@@ -94,6 +115,184 @@ class GeoPollSignals(QtCore.QObject):
     result = QtCore.Signal(bool, str)
 
 
+class ElidedLabel(QtWidgets.QLabel):
+    """QLabel that never widens its parent: long text is elided with an
+    ellipsis and the full text is shown in the tooltip."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt override)
+        self._full = text
+        self.setToolTip(text)
+        self._elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event) -> None:
+        self._elide()
+        super().resizeEvent(event)
+
+    def _elide(self) -> None:
+        super().setText(
+            self.fontMetrics().elidedText(
+                self._full, QtCore.Qt.TextElideMode.ElideRight, max(self.width(), 1)
+            )
+        )
+
+
+class CompassWidget(QtWidgets.QWidget):
+    """Compass with one gimbal needle + FOV wedge.
+
+    heading-up (default): rose rotates with the aircraft, nose is always up.
+    north-up: rose fixed with N at top, aircraft icon rotates to its heading.
+    Clicking the dial emits the absolute heading of the nearest 45° sector.
+    """
+
+    headingClicked = QtCore.Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.vehicle_heading: Optional[float] = None
+        self.gimbal_heading: Optional[float] = None
+        self.hfov: Optional[float] = None
+        self.north_up = False
+        self.hover_heading: Optional[float] = None
+        self.setFixedSize(130, 130)
+        self.setMouseTracking(True)
+
+    def set_north_up(self, enabled: bool) -> None:
+        self.north_up = bool(enabled)
+        self.update()
+
+    def heading_at(self, x: float, y: float) -> Optional[float]:
+        """Absolute heading of the 45° sector under widget pixel (x, y),
+        or None when the click is outside the dial or at its centre."""
+        dx, dy = x - self.width() / 2, y - (self.height() / 2 - 4)
+        r = min(self.width(), self.height()) / 2 - 12
+        if dx * dx + dy * dy > r * r or dx * dx + dy * dy < 100:
+            return None
+        screen = math.degrees(math.atan2(dx, -dy))  # 0 = up, clockwise
+        if not self.north_up:
+            screen += self.vehicle_heading or 0.0
+        return round(screen / 45.0) * 45.0 % 360.0
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            hdg = self.heading_at(event.position().x(), event.position().y())
+            if hdg is not None:
+                self.headingClicked.emit(hdg)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        hdg = self.heading_at(event.position().x(), event.position().y())
+        if hdg != self.hover_heading:
+            self.hover_heading = hdg
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.hover_heading = None
+        self.update()
+        super().leaveEvent(event)
+
+    def set_headings(
+        self,
+        vehicle: Optional[float],
+        gimbal: Optional[float],
+        hfov: Optional[float],
+    ) -> None:
+        self.vehicle_heading = vehicle
+        self.gimbal_heading = gimbal
+        self.hfov = hfov
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r = min(w, h) / 2 - 12
+        p.translate(w / 2, h / 2 - 4)
+
+        hdg_val = self.vehicle_heading or 0.0
+        # heading-up: rose turns by -heading, icon fixed, needle relative.
+        # north-up: rose fixed, icon turns by heading, needle absolute.
+        rose_rot = 0.0 if self.north_up else -hdg_val
+        icon_rot = hdg_val if self.north_up else 0.0
+
+        # Hovered 45° sector, drawn in screen space under everything else.
+        if self.hover_heading is not None:
+            p.save()
+            p.rotate(self.hover_heading + rose_rot)
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(56, 189, 248, 60))
+            p.drawPie(QtCore.QRectF(-r, -r, 2 * r, 2 * r), int((90 - 22.5) * 16), 45 * 16)
+            p.restore()
+
+        # Rose.
+        p.save()
+        p.rotate(rose_rot)
+        p.setPen(QtGui.QPen(QtGui.QColor("#94a3b8"), 1.5))
+        p.drawEllipse(QtCore.QPointF(0, 0), r, r)
+        for deg in range(0, 360, 30):
+            p.save()
+            p.rotate(deg)
+            tick = 8 if deg % 90 == 0 else 4
+            p.drawLine(QtCore.QPointF(0, -r), QtCore.QPointF(0, -r + tick))
+            p.restore()
+        font = p.font()
+        font.setPointSize(8)
+        font.setBold(True)
+        p.setFont(font)
+        for deg, letter in ((0, "N"), (90, "E"), (180, "S"), (270, "W")):
+            a = math.radians(deg + rose_rot)
+            x, y = (r - 14) * math.sin(a), -(r - 14) * math.cos(a)
+            p.save()
+            p.rotate(-rose_rot)  # keep letters upright
+            p.setPen(QtGui.QColor("#ef4444" if letter == "N" else "#cbd5e1"))
+            p.drawText(QtCore.QRectF(x - 8, y - 8, 16, 16), QtCore.Qt.AlignmentFlag.AlignCenter, letter)
+            p.restore()
+        p.restore()
+
+        # Gimbal wedge + needle.
+        if self.gimbal_heading is not None and self.vehicle_heading is not None:
+            p.save()
+            p.rotate(self.gimbal_heading - self.vehicle_heading + icon_rot)
+            if self.hfov is not None and self.hfov > 0:
+                p.setPen(QtCore.Qt.PenStyle.NoPen)
+                p.setBrush(QtGui.QColor(245, 158, 11, 70))
+                rect = QtCore.QRectF(-r, -r, 2 * r, 2 * r)
+                p.drawPie(rect, int((90 - self.hfov / 2) * 16), int(self.hfov * 16))
+            p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 2.5))
+            p.drawLine(QtCore.QPointF(0, 0), QtCore.QPointF(0, -r))
+            p.restore()
+
+        # Aircraft icon.
+        p.save()
+        p.rotate(icon_rot)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor("#38bdf8" if self.vehicle_heading is not None else "#64748b"))
+        p.drawPolygon(QtGui.QPolygonF([
+            QtCore.QPointF(0, -12),
+            QtCore.QPointF(-7, 8),
+            QtCore.QPointF(0, 4),
+            QtCore.QPointF(7, 8),
+        ]))
+        p.restore()
+
+        # Numeric readout.
+        p.setPen(QtGui.QColor("#cbd5e1"))
+        hdg = "HDG ---" if self.vehicle_heading is None else f"HDG {self.vehicle_heading % 360:03.0f}"
+        p.drawText(QtCore.QRectF(-w / 2, r + 2, w, 14), QtCore.Qt.AlignmentFlag.AlignCenter, hdg)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
@@ -112,6 +311,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge_connected = False
         self.tracking_enabled = False
         self.zoom_active = False
+        # True while the RTSP URL ends in /ir (IR sensor view).
+        self.ir_stream = False
 
         self.geo_timeout_s = max(
             0.0,
@@ -357,6 +558,31 @@ class MainWindow(QtWidgets.QMainWindow):
             5, 0, 1, 4,
         )
 
+        self.compass = CompassWidget()
+        self.compass.setToolTip("Click a sector to yaw the gimbal to that heading.")
+        self.compass.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.compass.headingClicked.connect(
+            lambda hdg: self._send_remote_command(CMD_PAYLOAD_GIMBAL_YAW_HEADING, [hdg])
+        )
+        geo_grid.addWidget(
+            self.compass,
+            0, 4, 6, 1,
+            QtCore.Qt.AlignmentFlag.AlignTop,
+        )
+        self.north_up_button = QtWidgets.QPushButton("North up")
+        self.north_up_button.setCheckable(True)
+        self.north_up_button.setToolTip(
+            "Checked: N fixed at top, aircraft icon rotates.\n"
+            "Unchecked: nose fixed at top, rose rotates."
+        )
+        self.north_up_button.toggled.connect(self.compass.set_north_up)
+        geo_grid.addWidget(
+            self.north_up_button,
+            6, 4,
+            QtCore.Qt.AlignmentFlag.AlignHCenter,
+        )
+        geo_grid.setColumnStretch(3, 1)
+
         # --------------------------------------------------------------
         # RTSP
         # --------------------------------------------------------------
@@ -504,12 +730,11 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._send_remote_command(CMD_PAYLOAD_GIMBAL_LEVEL_ROLL, [])
         )
 
-        self.status_label = QtWidgets.QLabel(
-            "Ready"
-        )
+        self.status_label = ElidedLabel("Ready")
         self.status_label.setStyleSheet(
             "color: #38bdf8;"
         )
+        self.status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
 
         controls_row.addWidget(
             self.track_checkbox
@@ -535,10 +760,8 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_row.addSpacing(24)
         controls_row.addWidget(self.reset_gimbal_button)
         controls_row.addWidget(self.level_roll_button)
-        controls_row.addStretch(1)
-        controls_row.addWidget(
-            self.status_label
-        )
+        controls_row.addSpacing(24)
+        controls_row.addWidget(self.status_label, 1)
 
         layout.addWidget(conn_group)
         layout.addWidget(geo_group)
@@ -688,6 +911,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         self.geo_wait_started = None
+        self.compass.set_headings(None, None, None)
         self.geo_status_label.setText(
             "Estimator: waiting for bridge"
         )
@@ -918,7 +1142,8 @@ class MainWindow(QtWidgets.QMainWindow):
             vehicle_text = (
                 f"Vehicle: "
                 f"{vehicle_lat:.7f}, "
-                f"{vehicle_lon:.7f}"
+                f"{vehicle_lon:.7f} | "
+                f"{to_mgrs(vehicle_lat, vehicle_lon)}"
             )
 
             if vehicle_alt is not None:
@@ -992,6 +1217,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.gimbal_attitude_label.setText(
                 "Gimbal attitude: --"
             )
+
+        # Earth-frame camera yaw: executor value when the estimator ran,
+        # else mirror its frame logic (vehicle-frame yaw adds vehicle yaw).
+        cam_yaw = self._num(data.get("camera_yaw_ned_deg"))
+        if cam_yaw is None and gy is not None:
+            if gframe == "earth":
+                cam_yaw = gy
+            elif vy is not None:
+                cam_yaw = vy + gy
+        self.compass.set_headings(
+            vy, cam_yaw, self._num(data.get("hfov_deg"))
+        )
 
         tx = self._num(
             data.get("track_x")
@@ -1138,7 +1375,8 @@ class MainWindow(QtWidgets.QMainWindow):
             target_text = (
                 "Estimated target: "
                 f"{est_lat:.7f}, "
-                f"{est_lon:.7f}"
+                f"{est_lon:.7f} | "
+                f"{to_mgrs(est_lat, est_lon)}"
             )
 
             if est_alt is not None:
@@ -1205,7 +1443,8 @@ class MainWindow(QtWidgets.QMainWindow):
             text = (
                 "Gremsy TARGET_*: "
                 f"{native_lat:.7f}, "
-                f"{native_lon:.7f}"
+                f"{native_lon:.7f} | "
+                f"{to_mgrs(native_lat, native_lon)}"
             )
 
             if native_alt is not None:
@@ -1256,6 +1495,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 "RTSP URL is empty"
             )
             return
+
+        # ponytail: sensor is inferred from the relay path name.
+        self.ir_stream = (
+            url.rstrip("/").lower().endswith("/ir")
+        )
 
         ok = self.video_widget.start_stream(
             url
@@ -1351,15 +1595,15 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        ok, _ = self._send_remote_command(
+        ok, detail = self._send_remote_command(
             CMD_PAYLOAD_ZOOM_IN,
-            [],
+            ["ir"] if self.ir_stream else [],
         )
 
         if ok:
             self.zoom_active = True
             self.status_label.setText(
-                "Zooming in..."
+                detail if self.ir_stream else "Zooming in..."
             )
 
     def _zoom_out_pressed(self) -> None:
@@ -1369,19 +1613,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        ok, _ = self._send_remote_command(
+        ok, detail = self._send_remote_command(
             CMD_PAYLOAD_ZOOM_OUT,
-            [],
+            ["ir"] if self.ir_stream else [],
         )
 
         if ok:
             self.zoom_active = True
             self.status_label.setText(
-                "Zooming out..."
+                detail if self.ir_stream else "Zooming out..."
             )
 
     def _zoom_released(self) -> None:
-        if not self.bridge_connected:
+        if not self.bridge_connected or self.ir_stream:
+            # IR zoom is stepped per press; nothing to stop.
             self.zoom_active = False
             return
 
@@ -1526,18 +1771,19 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{y_payload})"
         )
 
-        ok, _ = self._send_remote_command(
+        ok, detail = self._send_remote_command(
             CMD_PAYLOAD_TOUCH,
-            [
-                x_payload,
-                y_payload,
-            ],
+            [x_payload, y_payload]
+            + (["ir"] if self.ir_stream else []),
         )
 
         if not ok:
             return
 
-        if self.tracking_enabled:
+        if self.ir_stream:
+            # Executor reports the remapped EO pixel and any FOV hint.
+            self.status_label.setText(detail)
+        elif self.tracking_enabled:
             self.status_label.setText(
                 f"Tracking target at "
                 f"({x_payload}, {y_payload})"
