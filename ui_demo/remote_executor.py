@@ -727,6 +727,17 @@ class RemoteExecutor:
             self._on_payload_param_changed
         )
 
+        # Record to the SD card, not internal storage. Set at connect rather
+        # than on Record so the card is mounted long before START.
+        # vio_define has no storage param; "STORAGE_TYPE" is the id the
+        # camera itself reports (camera_load_settings.py, 2026-09-18).
+        with self._sdk_send_lock:
+            self.sdk.setPayloadCameraParam(
+                "STORAGE_TYPE",
+                1,  # 0 internal | 1 SD card
+                mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
+            )
+
         # Ask once for the current IR palette and zoom so the UI can show them.
         with self._sdk_send_lock:
             self.sdk.getPayloadCameraSettingByID(
@@ -817,6 +828,13 @@ class RemoteExecutor:
         try:
             event_value = int(event)
             now = time.monotonic()
+
+            if event_value == int(
+                payload_status_event_t.PAYLOAD_PARAM_EXT_ACK
+            ):
+                # 0 accepted | 1 unsupported | 2 failed | 3 in progress
+                self._log(f"param ack result={int(param[0])}")
+                return
 
             if event_value == int(
                 payload_status_event_t.PAYLOAD_CAM_CAPTURE_STATUS
