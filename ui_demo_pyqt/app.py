@@ -349,6 +349,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.geo_timeout_notified = False
 
         self._geo_poll_busy = False
+        # A status requested before the last command is stale; mirroring
+        # it would flip back a box the user just clicked.
+        self._geo_req_mono = 0.0
+        self._last_cmd_mono = 0.0
         self._geo_poll_lock = (
             threading.Lock()
         )
@@ -609,7 +613,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hold_heading_checkbox = QtWidgets.QCheckBox("Hold heading")
         self.hold_heading_checkbox.setToolTip(
             "Keep the gimbal on the clicked compass heading as the aircraft yaws.\n"
-            "Reset Gimbal turns it off."
+            "A new compass click re-aims it. Track, a video click, Point at,\n"
+            "Track target, Level Roll or Reset Gimbal turn it off."
         )
         self.hold_heading_checkbox.toggled.connect(
             lambda on: self._send_remote_command(
@@ -636,7 +641,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.track_target_checkbox = QtWidgets.QCheckBox("Track target")
         self.track_target_checkbox.setToolTip(
             "Keep the gimbal pointed at the coordinate as the aircraft moves.\n"
-            "Clicking the compass or Reset Gimbal turns it off."
+            "A new Point at re-aims it. Track, a video click, the compass,\n"
+            "Hold heading, Level Roll or Reset Gimbal turn it off."
         )
         self.track_target_checkbox.toggled.connect(
             lambda on: self._send_remote_command(
@@ -706,7 +712,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.track_checkbox.setToolTip(
             "Unchecked: click points camera. "
-            "Checked: click acquires/tracks target."
+            "Checked: click acquires/tracks target.\n"
+            "The compass, Point at, either hold, Level Roll or Reset Gimbal\n"
+            "stop tracking and clear this box."
         )
         self.track_checkbox.stateChanged.connect(
             self._on_track_toggled
@@ -930,15 +938,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.geo_timeout_notified = False
 
-        self._send_remote_command(
-            CMD_PAYLOAD_TRACK,
-            [
-                1
-                if self.track_checkbox.isChecked()
-                else 0
-            ],
-        )
-
+        # No TRACK push here: the executor owns the mode state (a reconnect
+        # must not cancel a running hold); the status mirror syncs the boxes.
         self._send_remote_command(
             CMD_PAYLOAD_ZOOM_STOP,
             [],
@@ -1026,6 +1027,7 @@ class MainWindow(QtWidgets.QMainWindow):
             params=params,
             ack_required=True,
         )
+        self._last_cmd_mono = time.monotonic()
 
         if ok:
             self.status_label.setText(
@@ -1060,6 +1062,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._geo_poll_busy = True
 
+        self._geo_req_mono = time.monotonic()
         bridge = self.bridge
 
         thread = threading.Thread(
@@ -1168,19 +1171,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if recording is not None and bool(recording) != self.record_button.isChecked():
             self._set_record_ui(bool(recording))
 
-        # Mirror executor hold state (Reset Gimbal clears it there). One
-        # hold loop: it holds a heading unless a coordinate target is set.
-        hold = data.get("heading_hold_on")
-        if hold is not None:
-            has_target = data.get("hold_target") is not None
+        # Mirror the executor's gimbal owner. It arbitrates (latest command
+        # wins), so at most one of these three is ever on. blockSignals:
+        # mirroring must never echo a command back.
+        if "hold_mode" in data and self._geo_req_mono > self._last_cmd_mono:
+            mode = data.get("hold_mode")
+            track = bool(data.get("track_enabled"))
             for box, want in (
-                (self.hold_heading_checkbox, bool(hold) and not has_target),
-                (self.track_target_checkbox, bool(hold) and has_target),
+                (self.hold_heading_checkbox, mode == "heading"),
+                (self.track_target_checkbox, mode == "target"),
+                (self.track_checkbox, track),
             ):
                 if want != box.isChecked():
                     box.blockSignals(True)
                     box.setChecked(want)
                     box.blockSignals(False)
+            if track != self.tracking_enabled:
+                self.tracking_enabled = track
+                self.mode_label.setText(
+                    "Click mode: Track Target"
+                    if track
+                    else "Click mode: Point Camera"
+                )
 
         ap_connected = bool(
             data.get(

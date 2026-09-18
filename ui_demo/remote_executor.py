@@ -198,8 +198,9 @@ def _wrap_180(angle_deg: float) -> float:
     return (angle_deg + 180.0) % 360.0 - 180.0
 
 
-# ponytail: Gremsy yaw motor mechanical range, tune per gimbal model.
-GIMBAL_YAW_LIMIT_DEG = 170.0
+# ponytail: Gremsy yaw range, tune per gimbal model. Measured 2026-09-18
+# on the VIO: a move to -170 stopped dead at -144, so stay inside that.
+GIMBAL_YAW_LIMIT_DEG = 140.0
 
 
 def heading_to_gimbal_yaw(
@@ -228,15 +229,30 @@ def heading_to_gimbal_yaw(
 # ponytail: rate control only. The VIO gimbal app latches on the first
 # angle setpoint and the payload tracker never gets the gimbal back until
 # a power cycle (Gremsy/PayloadSdk#47 is the mirror image); rate
-# setpoints do not latch. P loop on the reported attitude, 20 Hz.
-RATE_GAIN = 2.0          # deg/s per deg of error
-RATE_MAX_DPS = 60.0
+# setpoints do not latch. PD loop on the reported attitude, 20 Hz.
+# Tuned 2026-09-18 against the VIO's logged moves: the gimbal follows a
+# rate command with ~0.2 s lag, so P alone (gain 5) overshot ~12 deg.
+# Gain 3 + 0.3 s lead simulates to <0.2 deg overshoot at that lag and
+# ~2 deg at double it. Overshoots on hardware: raise RATE_LEAD_S. Creeps
+# in: lower it. test_yaw_heading.py holds the plant model.
+RATE_GAIN = 3.0          # deg/s per deg of error
+RATE_LEAD_S = 0.3        # brake on where the gimbal will be this far ahead
+RATE_MAX_DPS = 120.0     # wanted, before the per-axis scale
 RATE_MIN_DPS = 3.0       # below this the motor does not move
 RATE_DONE_DEG = 1.0
-RATE_TIMEOUT_S = 8.0
-# ponytail: flip to -1.0 if the gimbal runs away from the target on that axis.
-YAW_RATE_SIGN = 1.0
-PITCH_RATE_SIGN = 1.0
+RATE_DONE_DPS = 5.0      # and nearly stopped, or the stop command coasts past
+RATE_STALL_S = 2.0       # abort when the error stops shrinking this long
+RATE_TIMEOUT_S = 30.0    # hard cap
+# Calibration, per axis: commanded = scale * wanted. Set from the
+# "rate move:" log line (wanted avg / achieved avg); negative flips an axis
+# that runs away from its target.
+# Measured 2026-09-18 on the VIO: a steady 120 dps command cruised at
+# 16-20 dps on long moves, and move times fit a linear 1/6 scaling.
+# Confirmed linear: with scale 6 the log read 'peak got 90 of 90 wanted'.
+# Pitch and roll are unmeasured: time the 'pitch N deg' of a Point at.
+YAW_RATE_SCALE = 6.0
+PITCH_RATE_SCALE = 1.0
+ROLL_RATE_SCALE = 1.0
 
 
 def rate_step(err_deg: float) -> float:
@@ -245,6 +261,12 @@ def rate_step(err_deg: float) -> float:
         return 0.0
     mag = min(RATE_MAX_DPS, max(RATE_MIN_DPS, RATE_GAIN * abs(err_deg)))
     return math.copysign(mag, err_deg)
+
+
+def rate_cmd(err_deg: float, rate_dps: float) -> float:
+    """PD: act on the error predicted RATE_LEAD_S ahead, which cancels the
+    gimbal's rate lag. rate_dps is the measured rate, positive toward +err."""
+    return rate_step(err_deg - RATE_LEAD_S * rate_dps)
 
 
 def yaw_path(cur_body_deg: float, tgt_body_deg: float) -> List[float]:
@@ -540,9 +562,12 @@ class RemoteExecutor:
         self._gimbal_mode = ""
         self._gimbal_flags = 0
         self._gimbal_frame = "unknown"
-        # Bumped per compass click; a queued via-nose leg checks it.
+        # Bumped by every gimbal-driving command; a rate mover whose seq is
+        # stale stops sending. See _take_gimbal.
         self._yaw_seq = 0
-        self._hold_on = False
+        # None | "heading" | "target". Heading and target are remembered
+        # independently; the mode says which one the hold loop follows.
+        self._hold_mode: Optional[str] = None
         self._hold_heading_deg: Optional[float] = None
         self._hold_last_cmd: Optional[float] = None
         self._hold_last_pitch: Optional[float] = None
@@ -769,7 +794,7 @@ class RemoteExecutor:
                         200,
                     )
 
-                # Request the gimbal-device attitude at ~5 Hz.
+                # Request the gimbal-device attitude at 20 Hz.
                 if (
                     self.sdk.master is not None
                 ):
@@ -779,7 +804,7 @@ class RemoteExecutor:
                         mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                         0,
                         mavutil.mavlink.MAVLINK_MSG_ID_GIMBAL_DEVICE_ATTITUDE_STATUS,
-                        200000,
+                        50000,  # 20 Hz: the rate loop closes on this
                         0,
                         0,
                         0,
@@ -1866,7 +1891,7 @@ class RemoteExecutor:
         result = {
             "ir_palette": self.ir_palette,
             "recording": self.recording,
-            "heading_hold_on": self._hold_on,
+            "hold_mode": self._hold_mode,
             "heading_hold_deg": self._hold_heading_deg,
             "hold_target": self._hold_target,
             "ardupilot_connected": (
@@ -2315,10 +2340,11 @@ class RemoteExecutor:
                     else False
                 )
 
+                # Ticking Track takes the gimbal from any hold or move;
+                # unticking only stops the tracker and leaves holds alone.
+                if enable:
+                    self._take_gimbal("tracker")
                 self.track_on_click = enable
-                # A video click must win over the hold loop.
-                with self._state_lock:
-                    self._hold_on = False
 
                 if not enable:
                     with self._sdk_send_lock:
@@ -2344,8 +2370,7 @@ class RemoteExecutor:
                 )
 
             if command == CMD_PAYLOAD_TOUCH:
-                with self._state_lock:
-                    self._hold_on = False
+                self._take_gimbal("tracker")
                 x = (
                     int(params[0])
                     if len(params) > 0
@@ -2538,8 +2563,7 @@ class RemoteExecutor:
 
             if command == CMD_PAYLOAD_GIMBAL_MODE:
                 mode = int(params[0])
-                with self._state_lock:
-                    self._hold_on = False
+                self._take_gimbal("reset")
                 with self._sdk_send_lock:
                     self.sdk.setPayloadCameraParam(
                         PAYLOAD_CAMERA_GIMBAL_MODE,
@@ -2559,20 +2583,22 @@ class RemoteExecutor:
                 # ponytail: only helps when the gimbal *reports* the roll
                 # (commanded/mechanical). IMU horizon drift reads ~0 and
                 # needs gyro calib / vehicle attitude feed instead.
+                self._take_gimbal("executor")
                 with self._state_lock:
                     vy = self._vehicle_yaw_deg
                     frame = self._gimbal_frame
                     self._yaw_seq += 1
                     seq = self._yaw_seq
                 body = _wrap_180(yaw - (vy if frame == "earth" and vy else 0.0))
-                self._start_rate_move(seq, pitch, [body])
+                self._start_rate_move(seq, pitch, body, tgt_roll=0.0)
                 return True, f"roll->0 (pitch={pitch:.1f} yaw={yaw:.1f})"
 
             if command == CMD_PAYLOAD_GIMBAL_YAW_HEADING:
                 heading = float(params[0])
                 with self._state_lock:
                     self._hold_heading_deg = heading
-                    self._hold_target = None
+                # A heading hold follows the new click; a coordinate hold ends.
+                self._take_gimbal("executor", keep_hold="heading")
                 return self._yaw_to_heading(heading)
 
             if command == CMD_PAYLOAD_GIMBAL_POINT_AT:
@@ -2581,25 +2607,34 @@ class RemoteExecutor:
                     return False, "lat/lon out of range"
                 with self._state_lock:
                     self._hold_target = (lat, lon)
-                    self._hold_heading_deg = None
-                    self._hold_last_cmd = None
+                # A coordinate hold follows the new point; a heading hold ends.
+                self._take_gimbal("executor", keep_hold="target")
                 return self._point_at_target()
 
             if command in (
                 CMD_PAYLOAD_GIMBAL_HEADING_HOLD, CMD_PAYLOAD_GIMBAL_TARGET_TRACK
             ):
                 on = bool(int(params[0]))
+                mode = (
+                    "heading"
+                    if command == CMD_PAYLOAD_GIMBAL_HEADING_HOLD
+                    else "target"
+                )
                 with self._state_lock:
-                    self._hold_on = on
-                    self._hold_last_cmd = None
+                    active = self._hold_mode == mode
                     heading = self._hold_heading_deg
                     target = self._hold_target
                 if not on:
+                    # Unticking a box that another mode already replaced
+                    # must not kill that other mode.
+                    if active:
+                        self._take_gimbal("executor")
                     return True, "hold off"
-                if command == CMD_PAYLOAD_GIMBAL_TARGET_TRACK and target is None:
-                    with self._state_lock:
-                        self._hold_on = False
+                if mode == "target" and target is None:
                     return False, "no target coordinate yet"
+                self._take_gimbal("executor")
+                with self._state_lock:
+                    self._hold_mode = mode
                 # Follow mode: gimbal yaw is nose-relative, so the hold loop
                 # (driven by autopilot heading) is the thing keeping it on
                 # heading. In lock mode the gimbal's own IMU north wins and
@@ -2610,7 +2645,7 @@ class RemoteExecutor:
                         2,
                         mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
                     )
-                if target is not None:
+                if mode == "target":
                     return self._point_at_target()
                 if heading is None:
                     return True, "heading hold on, click a heading"
@@ -2627,18 +2662,47 @@ class RemoteExecutor:
                 f"execution error: {exc}",
             )
 
+    def _take_gimbal(self, owner: str, keep_hold: Optional[str] = None) -> None:
+        """Latest intent wins: every gimbal-driving command calls this first.
+
+        owner "tracker"  - a video click / Track tick: the payload tracker
+                           drives next, so executor holds and moves end.
+        owner "executor" - compass, point-at, holds, level roll: the rate
+                           loop drives next, so the payload tracker stops
+                           and the Track box clears.
+        owner "reset"    - both.
+        keep_hold: a hold mode that survives (a compass click re-targets a
+        heading hold instead of ending it).
+        """
+        with self._state_lock:
+            self._yaw_seq += 1  # any running rate mover is now stale
+            if self._hold_mode != keep_hold:
+                self._hold_mode = None
+            self._hold_last_cmd = None
+            if owner != "tracker":
+                self._selected_x = None
+                self._selected_y = None
+                self._last_selected_mono = 0.0
+        if owner != "tracker":
+            self.track_on_click = False
+        with self._sdk_send_lock:
+            # Always stop: a stale mover exits without one, and the command
+            # that called us may fail before it starts a new move.
+            self.sdk.setGimbalSpeed(0.0, 0.0, 0.0, input_mode_t.INPUT_SPEED)
+            if owner != "tracker":
+                self.sdk.setPayloadObjectTrackingMode(
+                    tracking_mode_t.TRACK_STOP
+                )
+
     def _hold_step(self, only_if_changed: bool = False) -> None:
-        """One tick of the hold loop: re-point at the coordinate if there
-        is one, else at the held heading. Called on ATTITUDE and
+        """One tick of the hold loop. Called on ATTITUDE and
         GLOBAL_POSITION_INT."""
         with self._state_lock:
-            if not self._hold_on:
-                return
+            mode = self._hold_mode
             heading = self._hold_heading_deg
-            target = self._hold_target
-        if target is not None:
+        if mode == "target":
             self._point_at_target(only_if_changed=only_if_changed)
-        elif heading is not None:
+        elif mode == "heading" and heading is not None:
             self._yaw_to_heading(heading, only_if_changed=only_if_changed)
 
     def _point_at_target(self, only_if_changed: bool = False) -> Tuple[bool, str]:
@@ -2712,6 +2776,10 @@ class RemoteExecutor:
         ):
             return True, "unchanged"
         with self._state_lock:
+            # A hold tick that read its state before a newer command took
+            # the gimbal must not start a move on top of it.
+            if only_if_changed and self._hold_mode is None:
+                return True, "hold cancelled"
             self._hold_last_cmd = yaw
             self._hold_last_pitch = pitch
             self._yaw_seq += 1
@@ -2720,59 +2788,137 @@ class RemoteExecutor:
             cur_yaw - (vehicle_yaw if frame == "earth" else 0.0)
         )
         path = yaw_path(cur_body, body)
-        self._start_rate_move(seq, pitch, path)
+        self._start_rate_move(seq, pitch, path[-1])
         note = (
             f", clamped to {body:+.0f} of nose" if clamped else ""
         ) + (", via nose" if len(path) > 1 else "")
         return True, f"heading {heading:.0f} -> yaw {yaw:.1f} ({frame}{note})"
 
     def _start_rate_move(
-        self, seq: int, tgt_pitch: float, body_path: List[float]
+        self,
+        seq: int,
+        tgt_pitch: float,
+        tgt_body: float,
+        tgt_roll: Optional[float] = None,
     ) -> None:
         self._mover = threading.Thread(
-            target=self._rate_move, args=(seq, tgt_pitch, body_path), daemon=True
+            target=self._rate_move,
+            args=(seq, tgt_pitch, tgt_body, tgt_roll),
+            daemon=True,
         )
         self._mover.start()
 
-    def _send_rate(self, pitch_dps: float, yaw_dps: float) -> None:
+    def _send_rate(
+        self, seq: int, pitch_dps: float, yaw_dps: float, roll_dps: float = 0.0
+    ) -> bool:
+        """Send a rate unless a newer command owns the gimbal. The seq check
+        sits inside the send lock, and _take_gimbal bumps seq before it
+        sends its stop under the same lock, so a stale mover can never put
+        a rate on the wire after that stop."""
         with self._sdk_send_lock:
+            if seq != self._yaw_seq:
+                return False
             self.sdk.setGimbalSpeed(
-                PITCH_RATE_SIGN * pitch_dps, 0.0, YAW_RATE_SIGN * yaw_dps,
+                PITCH_RATE_SCALE * pitch_dps,
+                ROLL_RATE_SCALE * roll_dps,
+                YAW_RATE_SCALE * yaw_dps,
                 input_mode_t.INPUT_SPEED,
             )
+        return True
 
     def _rate_move(
-        self, seq: int, tgt_pitch: float, body_path: List[float]
+        self,
+        seq: int,
+        tgt_pitch: float,
+        tgt_body: float,
+        tgt_roll: Optional[float] = None,
     ) -> None:
-        """Drive pitch and body yaw to each waypoint with rate commands,
-        then stop. A newer command (seq) aborts this one."""
-        deadline = time.monotonic() + RATE_TIMEOUT_S
-        for tgt_body in body_path:
-            while True:
-                with self._state_lock:
-                    if seq != self._yaw_seq:
-                        return  # newer command took over, it sends its own stop
-                    gp = self._gimbal_pitch_deg
-                    gy = self._gimbal_yaw_deg
-                    vy = self._vehicle_yaw_deg
-                    frame = self._gimbal_frame
-                if time.monotonic() > deadline:
-                    self._send_rate(0.0, 0.0)
-                    self._log(f"rate move: timed out short of body {tgt_body:+.0f}")
-                    return
-                if gp is None or gy is None:
-                    time.sleep(0.05)
-                    continue
-                cur_body = _wrap_180(
-                    gy - (vy if frame == "earth" and vy is not None else 0.0)
-                )
-                ep = tgt_pitch - gp
-                ey = _wrap_180(tgt_body - cur_body)
-                if abs(ep) < RATE_DONE_DEG and abs(ey) < RATE_DONE_DEG:
-                    break
-                self._send_rate(rate_step(ep), rate_step(ey))
+        """Drive pitch, body yaw (and roll, if given) to the target with
+        rate commands, then stop. A newer command (seq) aborts this one."""
+        t0 = best_t = time.monotonic()
+        best = float("inf")
+        travelled = pitch_travelled = peak = got = 0.0
+        win_t, win_yaw = t0, 0.0
+        prev_body: Optional[float] = None
+        prev_pitch: Optional[float] = None
+        prev_roll = 0.0
+        prev_ts = 0.0
+        ry = rp = rr = 0.0  # measured rates, deg/s, lightly filtered
+        first_err: Optional[float] = None
+        cur_body = float("nan")
+        outcome = "arrived"
+        while True:
+            with self._state_lock:
+                ts = self._last_gimbal_mono  # when this attitude arrived
+                gp = self._gimbal_pitch_deg
+                gr = self._gimbal_roll_deg
+                gy = self._gimbal_yaw_deg
+                vy = self._vehicle_yaw_deg
+                frame = self._gimbal_frame
+            now = time.monotonic()
+            if now - t0 > RATE_TIMEOUT_S:
+                outcome = "timeout"
+                break
+            if gp is None or gy is None:
                 time.sleep(0.05)
-        self._send_rate(0.0, 0.0)
+                continue
+            cur_body = _wrap_180(
+                gy - (vy if frame == "earth" and vy is not None else 0.0)
+            )
+            # Travel and rates only from a fresh attitude sample: the loop
+            # and the 20 Hz feed are not in step, so a repeated sample must
+            # not count twice or read as zero rate.
+            if prev_body is not None and ts > prev_ts:
+                h = ts - prev_ts
+                travelled += abs(_wrap_180(cur_body - prev_body))
+                pitch_travelled += abs(gp - prev_pitch)
+                ry = 0.5 * ry + 0.5 * _wrap_180(cur_body - prev_body) / h
+                rp = 0.5 * rp + 0.5 * (gp - prev_pitch) / h
+                rr = 0.5 * rr + 0.5 * ((gr or 0.0) - prev_roll) / h
+            if prev_body is None or ts > prev_ts:
+                prev_body, prev_pitch, prev_roll, prev_ts = cur_body, gp, gr or 0.0, ts
+            if now - win_t >= 0.5:  # achieved cruise rate, half-second windows
+                got = max(got, (travelled - win_yaw) / (now - win_t))
+                win_t, win_yaw = now, travelled
+            ep = tgt_pitch - gp
+            # Not wrapped on purpose: both are in +-180 of the nose, so the
+            # straight difference goes round the front and never crosses
+            # the rear stop.
+            ey = tgt_body - cur_body
+            er = 0.0 if tgt_roll is None or gr is None else tgt_roll - gr
+            if first_err is None:
+                first_err = abs(ey)
+            if (
+                max(abs(ep), abs(ey), abs(er)) < RATE_DONE_DEG
+                and max(abs(rp), abs(ry), abs(rr)) < RATE_DONE_DPS
+            ):
+                break
+            err = abs(ep) + abs(ey) + abs(er)
+            if err < best - 1.0:
+                best, best_t = err, now
+            elif now - best_t > RATE_STALL_S:
+                outcome = "stalled"
+                break
+            yaw_dps = rate_cmd(ey, ry)
+            peak = max(peak, abs(yaw_dps))
+            if not self._send_rate(
+                seq, rate_cmd(ep, rp), yaw_dps, rate_cmd(er, rr)
+            ):
+                return  # newer command took over and already sent the stop
+            time.sleep(0.05)
+        self._send_rate(seq, 0.0, 0.0)
+        dt = max(time.monotonic() - t0, 1e-3)
+        # Hold ticks make many 2 deg moves; only log the ones worth reading.
+        if travelled >= 10.0 or outcome != "arrived":
+            self._log(
+                f"rate move: yaw {travelled:.0f} deg in {dt:.1f} s "
+                f"(avg {travelled / dt:.0f} dps, peak got {got:.0f} of "
+                f"{peak:.0f} wanted, {peak * abs(YAW_RATE_SCALE):.0f} sent), "
+                f"overshoot {max(0.0, (travelled - (first_err or 0.0)) / 2):.0f} deg, "
+                f"pitch {pitch_travelled:.0f} deg "
+                f"-> {outcome} at body {cur_body:+.0f}"
+                f" of {tgt_body:+.0f}"
+            )
 
     @staticmethod
     def _log(message: str) -> None:
