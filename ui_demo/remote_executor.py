@@ -104,6 +104,7 @@ CMD_PAYLOAD_CAMERA_PARAM = "PAYLOAD_CAMERA_PARAM"
 CMD_PAYLOAD_RECORD = "PAYLOAD_RECORD"  # params: [1 start | 0 stop]
 # params: [GB_MODE int]; 0 off, 1 lock, 2 follow, 3 mapping, 4 reset (recenter)
 CMD_PAYLOAD_GIMBAL_MODE = "PAYLOAD_GIMBAL_MODE"
+GIMBAL_MODE_RESET = 4  # momentary recentre, not a mode the gimbal stays in
 # no params; angle command roll=0 keeping current pitch/yaw
 CMD_PAYLOAD_GIMBAL_LEVEL_ROLL = "PAYLOAD_GIMBAL_LEVEL_ROLL"
 # params: [heading_deg]; yaw the gimbal to an absolute compass heading,
@@ -112,6 +113,12 @@ CMD_PAYLOAD_GIMBAL_YAW_HEADING = "PAYLOAD_GIMBAL_YAW_HEADING"
 # params: [1 on | 0 off]; keep re-commanding the last clicked heading as
 # the vehicle yaws
 CMD_PAYLOAD_GIMBAL_HEADING_HOLD = "PAYLOAD_GIMBAL_HEADING_HOLD"
+# params: [lat_deg, lon_deg]; point the gimbal (yaw + pitch) at a ground
+# coordinate, assumed at home altitude
+CMD_PAYLOAD_GIMBAL_POINT_AT = "PAYLOAD_GIMBAL_POINT_AT"
+# params: [1 on | 0 off]; keep re-pointing at the last coordinate as the
+# vehicle moves (same hold loop as HEADING_HOLD)
+CMD_PAYLOAD_GIMBAL_TARGET_TRACK = "PAYLOAD_GIMBAL_TARGET_TRACK"
 
 # params: [name, int value]; allowlist of settable camera params
 CAMERA_PARAMS = {
@@ -166,6 +173,23 @@ def ir_px_to_eo_px(
     )
 
 
+def ir_fov_deg(
+    hfov_1x_deg: float, zoom_level: int, aspect: float
+) -> Tuple[float, float]:
+    """(hfov, vfov) of the IR video at zoom_level (0 = 1x, n = (n+1)x).
+
+    vfov is derived from hfov and the streamed frame's aspect (w/h), not
+    from the sensor: the payload delivers the 5:4 Boson image as a 16:9
+    stream by cropping, so the frame spans the full 32 deg wide but only
+    ~18 deg tall. Assumes square pixels (no anisotropic stretch).
+    """
+    tan_h = math.tan(math.radians(hfov_1x_deg) / 2.0) / (zoom_level + 1)
+    return (
+        2.0 * math.degrees(math.atan(tan_h)),
+        2.0 * math.degrees(math.atan(tan_h / aspect)),
+    )
+
+
 def _wrap_360(angle_deg: float) -> float:
     return angle_deg % 360.0
 
@@ -201,8 +225,26 @@ def heading_to_gimbal_yaw(
     return cmd, body, clamped
 
 
-def _body_to_cmd(body_deg: float, vehicle_yaw_deg: float, frame: str) -> float:
-    return body_deg if frame != "earth" else _wrap_180(body_deg + vehicle_yaw_deg)
+# ponytail: rate control only. The VIO gimbal app latches on the first
+# angle setpoint and the payload tracker never gets the gimbal back until
+# a power cycle (Gremsy/PayloadSdk#47 is the mirror image); rate
+# setpoints do not latch. P loop on the reported attitude, 20 Hz.
+RATE_GAIN = 2.0          # deg/s per deg of error
+RATE_MAX_DPS = 60.0
+RATE_MIN_DPS = 3.0       # below this the motor does not move
+RATE_DONE_DEG = 1.0
+RATE_TIMEOUT_S = 8.0
+# ponytail: flip to -1.0 if the gimbal runs away from the target on that axis.
+YAW_RATE_SIGN = 1.0
+PITCH_RATE_SIGN = 1.0
+
+
+def rate_step(err_deg: float) -> float:
+    """Rate command for an angle error: P, floored, capped, with deadband."""
+    if abs(err_deg) < RATE_DONE_DEG:
+        return 0.0
+    mag = min(RATE_MAX_DPS, max(RATE_MIN_DPS, RATE_GAIN * abs(err_deg)))
+    return math.copysign(mag, err_deg)
 
 
 def yaw_path(cur_body_deg: float, tgt_body_deg: float) -> List[float]:
@@ -216,6 +258,25 @@ def yaw_path(cur_body_deg: float, tgt_body_deg: float) -> List[float]:
         and abs(cur_body_deg) + abs(tgt_body_deg) > 180.0
     )
     return [0.0, tgt_body_deg] if crosses_rear else [tgt_body_deg]
+
+
+def look_angles_to_target(
+    lat_deg: float,
+    lon_deg: float,
+    rel_alt_m: float,
+    tgt_lat_deg: float,
+    tgt_lon_deg: float,
+) -> Tuple[float, float, float]:
+    """(heading_deg, pitch_deg, ground_dist_m) from the vehicle to a point
+    on the ground. pitch is negative = down. Flat-earth; fine for the few
+    km a gimbal can resolve."""
+    lat0 = math.radians(lat_deg)
+    north = math.radians(tgt_lat_deg - lat_deg) * EARTH_RADIUS_M
+    east = math.radians(tgt_lon_deg - lon_deg) * EARTH_RADIUS_M * math.cos(lat0)
+    dist = math.hypot(north, east)
+    heading = _wrap_360(math.degrees(math.atan2(east, north)))
+    pitch = -math.degrees(math.atan2(rel_alt_m, dist))
+    return heading, pitch, dist
 
 
 def _matmul3(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]):
@@ -305,7 +366,6 @@ class RemoteExecutor:
         fallback_hfov_deg: float,
         fallback_vfov_deg: float,
         ir_hfov_deg: float,
-        ir_vfov_deg: float,
         camera_roll_offset_deg: float,
         camera_pitch_offset_deg: float,
         camera_yaw_offset_deg: float,
@@ -373,14 +433,10 @@ class RemoteExecutor:
             1.0,
             min(179.0, float(fallback_vfov_deg)),
         )
-        # Native (1x) IR FOV; the zoomed FOV is derived from ir_zoom.
+        # Native (1x) IR HFOV; zoomed FOV and VFOV derived in ir_fov_deg.
         self.ir_hfov_deg = max(
             1.0,
             min(179.0, float(ir_hfov_deg)),
-        )
-        self.ir_vfov_deg = max(
-            1.0,
-            min(179.0, float(ir_vfov_deg)),
         )
 
         self.camera_roll_offset_deg = float(
@@ -489,6 +545,8 @@ class RemoteExecutor:
         self._hold_on = False
         self._hold_heading_deg: Optional[float] = None
         self._hold_last_cmd: Optional[float] = None
+        self._hold_last_pitch: Optional[float] = None
+        self._hold_target: Optional[Tuple[float, float]] = None
         self._last_gimbal_mono = 0.0
 
         # Tracker
@@ -1271,10 +1329,7 @@ class RemoteExecutor:
                 )
             )
             self._last_ap_attitude_mono = now
-            hold = self._hold_on
-            heading = self._hold_heading_deg
-        if hold and heading is not None:
-            self._yaw_to_heading(heading, only_if_changed=True)
+        self._hold_step(only_if_changed=True)
 
     def _handle_ardupilot_global_position(
         self,
@@ -1313,6 +1368,7 @@ class RemoteExecutor:
                 self._home_alt_m = (
                     alt_m - relative_alt_m
                 )
+        self._hold_step(only_if_changed=True)
 
         # Forward the vehicle position to Gremsy as well.
         if (
@@ -1648,9 +1704,12 @@ class RemoteExecutor:
             )
 
         # If tracking is still enabled, Gremsy's job is to keep the tracked
-        # object near image center. This is a more useful fallback than
+        # object near image center. A point-camera click (EagleEyes) also
+        # slews the clicked pixel to center. Either way center beats
         # retaining the original off-center click indefinitely.
-        if self.track_on_click:
+        # ponytail: assumes the slew finished within 1.5s; feed gimbal
+        # rate in if that proves wrong.
+        if self.track_on_click or selected_update > 0.0:
             return (
                 GREMSY_FRAME_W / 2.0,
                 GREMSY_FRAME_H / 2.0,
@@ -1791,6 +1850,7 @@ class RemoteExecutor:
             "recording": self.recording,
             "heading_hold_on": self._hold_on,
             "heading_hold_deg": self._hold_heading_deg,
+            "hold_target": self._hold_target,
             "ardupilot_connected": (
                 ardupilot_connected
             ),
@@ -1892,14 +1952,8 @@ class RemoteExecutor:
             )
             return result
 
-        if not self.track_on_click:
-            result["estimate_reason"] = (
-                "Tracking not enabled"
-            )
-            return result
-
         # 2 means TRACK_LOST in the PayloadSdk.
-        if track_status == 2:
+        if self.track_on_click and track_status == 2:
             result["estimate_reason"] = (
                 "Gremsy tracker reports LOST"
             )
@@ -2244,6 +2298,9 @@ class RemoteExecutor:
                 )
 
                 self.track_on_click = enable
+                # A video click must win over the hold loop.
+                with self._state_lock:
+                    self._hold_on = False
 
                 if not enable:
                     with self._sdk_send_lock:
@@ -2269,6 +2326,8 @@ class RemoteExecutor:
                 )
 
             if command == CMD_PAYLOAD_TOUCH:
+                with self._state_lock:
+                    self._hold_on = False
                 x = (
                     int(params[0])
                     if len(params) > 0
@@ -2287,13 +2346,15 @@ class RemoteExecutor:
                     with self._state_lock:
                         eo_h = self._hfov_deg or self.fallback_hfov_deg
                         eo_v = self._vfov_deg or self.fallback_vfov_deg
-                    n = (self.ir_zoom or 0) + 1
-                    ir_h = 2.0 * math.degrees(math.atan(
-                        math.tan(math.radians(self.ir_hfov_deg) / 2.0) / n
-                    ))
-                    ir_v = 2.0 * math.degrees(math.atan(
-                        math.tan(math.radians(self.ir_vfov_deg) / 2.0) / n
-                    ))
+                    # params[3]: w/h of the IR frame the click came from.
+                    aspect = (
+                        float(params[3])
+                        if len(params) > 3 and float(params[3]) > 0
+                        else GREMSY_FRAME_W / GREMSY_FRAME_H
+                    )
+                    ir_h, ir_v = ir_fov_deg(
+                        self.ir_hfov_deg, self.ir_zoom or 0, aspect
+                    )
                     x_ir, y_ir = x, y
                     x, y, inside = ir_px_to_eo_px(
                         x, y, ir_h, ir_v, eo_h, eo_v
@@ -2323,14 +2384,16 @@ class RemoteExecutor:
                     ),
                 )
 
-                if self.track_on_click:
-                    with self._state_lock:
-                        self._selected_x = float(x)
-                        self._selected_y = float(y)
-                        self._last_selected_mono = (
-                            time.monotonic()
-                        )
+                # Remember the click in both modes so the geolocation
+                # estimator has a pixel to work from.
+                with self._state_lock:
+                    self._selected_x = float(x)
+                    self._selected_y = float(y)
+                    self._last_selected_mono = (
+                        time.monotonic()
+                    )
 
+                if self.track_on_click:
                     with self._sdk_send_lock:
                         self.sdk.setPayloadObjectTrackingMode(
                             tracking_mode_t.TRACK_ACTIVE
@@ -2465,6 +2528,8 @@ class RemoteExecutor:
                         mode,
                         mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
                     )
+                if mode == GIMBAL_MODE_RESET:
+                    self.sdk.current_gimbal_mode = None
                 return True, f"gimbal mode {mode}"
 
             if command == CMD_PAYLOAD_GIMBAL_LEVEL_ROLL:
@@ -2476,26 +2541,47 @@ class RemoteExecutor:
                 # ponytail: only helps when the gimbal *reports* the roll
                 # (commanded/mechanical). IMU horizon drift reads ~0 and
                 # needs gyro calib / vehicle attitude feed instead.
-                with self._sdk_send_lock:
-                    self.sdk.setGimbalSpeed(
-                        pitch, 0.0, yaw, input_mode_t.INPUT_ANGLE
-                    )
+                with self._state_lock:
+                    vy = self._vehicle_yaw_deg
+                    frame = self._gimbal_frame
+                    self._yaw_seq += 1
+                    seq = self._yaw_seq
+                body = _wrap_180(yaw - (vy if frame == "earth" and vy else 0.0))
+                self._start_rate_move(seq, pitch, [body])
                 return True, f"roll->0 (pitch={pitch:.1f} yaw={yaw:.1f})"
 
             if command == CMD_PAYLOAD_GIMBAL_YAW_HEADING:
                 heading = float(params[0])
                 with self._state_lock:
                     self._hold_heading_deg = heading
+                    self._hold_target = None
                 return self._yaw_to_heading(heading)
 
-            if command == CMD_PAYLOAD_GIMBAL_HEADING_HOLD:
+            if command == CMD_PAYLOAD_GIMBAL_POINT_AT:
+                lat, lon = float(params[0]), float(params[1])
+                if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                    return False, "lat/lon out of range"
+                with self._state_lock:
+                    self._hold_target = (lat, lon)
+                    self._hold_heading_deg = None
+                    self._hold_last_cmd = None
+                return self._point_at_target()
+
+            if command in (
+                CMD_PAYLOAD_GIMBAL_HEADING_HOLD, CMD_PAYLOAD_GIMBAL_TARGET_TRACK
+            ):
                 on = bool(int(params[0]))
                 with self._state_lock:
                     self._hold_on = on
                     self._hold_last_cmd = None
                     heading = self._hold_heading_deg
+                    target = self._hold_target
                 if not on:
-                    return True, "heading hold off"
+                    return True, "hold off"
+                if command == CMD_PAYLOAD_GIMBAL_TARGET_TRACK and target is None:
+                    with self._state_lock:
+                        self._hold_on = False
+                    return False, "no target coordinate yet"
                 # Follow mode: gimbal yaw is nose-relative, so the hold loop
                 # (driven by autopilot heading) is the thing keeping it on
                 # heading. In lock mode the gimbal's own IMU north wins and
@@ -2506,6 +2592,8 @@ class RemoteExecutor:
                         2,
                         mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
                     )
+                if target is not None:
+                    return self._point_at_target()
                 if heading is None:
                     return True, "heading hold on, click a heading"
                 return self._yaw_to_heading(heading)
@@ -2521,14 +2609,60 @@ class RemoteExecutor:
                 f"execution error: {exc}",
             )
 
+    def _hold_step(self, only_if_changed: bool = False) -> None:
+        """One tick of the hold loop: re-point at the coordinate if there
+        is one, else at the held heading. Called on ATTITUDE and
+        GLOBAL_POSITION_INT."""
+        with self._state_lock:
+            if not self._hold_on:
+                return
+            heading = self._hold_heading_deg
+            target = self._hold_target
+        if target is not None:
+            self._point_at_target(only_if_changed=only_if_changed)
+        elif heading is not None:
+            self._yaw_to_heading(heading, only_if_changed=only_if_changed)
+
+    def _point_at_target(self, only_if_changed: bool = False) -> Tuple[bool, str]:
+        with self._state_lock:
+            target = self._hold_target
+            lat = self._vehicle_lat
+            lon = self._vehicle_lon
+            rel_alt = self._vehicle_relative_alt_m
+            vehicle_pitch = self._vehicle_pitch_deg
+            flags = self._gimbal_flags
+        if target is None:
+            return False, "no target coordinate"
+        if lat is None or lon is None:
+            return False, "no vehicle position yet"
+        # ponytail: target assumed at home altitude; feed a DEM here if
+        # terrain matters. rel_alt None -> horizon.
+        heading, pitch, dist = look_angles_to_target(
+            lat, lon, rel_alt or 0.0, target[0], target[1]
+        )
+        pitch -= self.camera_pitch_offset_deg
+        pitch_lock = bool(
+            flags & getattr(mavutil.mavlink, "GIMBAL_DEVICE_FLAGS_PITCH_LOCK", 8)
+        )
+        if not pitch_lock and vehicle_pitch is not None:
+            pitch -= vehicle_pitch
+        pitch = max(-90.0, min(45.0, pitch))
+        ok, note = self._yaw_to_heading(
+            heading, only_if_changed=only_if_changed, pitch_override=pitch
+        )
+        return ok, f"target {dist:.0f} m, pitch {pitch:.0f}: {note}"
+
     def _yaw_to_heading(
-        self, heading: float, only_if_changed: bool = False
+        self,
+        heading: float,
+        only_if_changed: bool = False,
+        pitch_override: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """Yaw the gimbal to a compass heading, keeping pitch, roll=0.
 
-        only_if_changed: skip the send unless the setpoint moved >2 deg
-        since the last one (the heading-hold loop calls this on every
-        ATTITUDE message).
+        only_if_changed: skip unless the setpoint moved >2 deg since the
+        last one (the hold loop calls this on every ATTITUDE message).
+        pitch_override: drive to this pitch instead of holding the current.
         """
         with self._state_lock:
             pitch = self._gimbal_pitch_deg
@@ -2536,8 +2670,11 @@ class RemoteExecutor:
             frame = self._gimbal_frame
             vehicle_yaw = self._vehicle_yaw_deg
             last_cmd = self._hold_last_cmd
+            last_pitch = self._hold_last_pitch
         if pitch is None or cur_yaw is None:
             return False, "no gimbal attitude yet"
+        if pitch_override is not None:
+            pitch = pitch_override
         # Vehicle yaw is needed in every frame: the +-limit is on
         # the yaw relative to the nose.
         if vehicle_yaw is None:
@@ -2549,68 +2686,80 @@ class RemoteExecutor:
             only_if_changed
             and last_cmd is not None
             and abs(_wrap_180(yaw - last_cmd)) < 2.0
+            and (
+                pitch_override is None
+                or last_pitch is None
+                or abs(pitch - last_pitch) < 2.0
+            )
         ):
             return True, "unchanged"
         with self._state_lock:
             self._hold_last_cmd = yaw
+            self._hold_last_pitch = pitch
             self._yaw_seq += 1
             seq = self._yaw_seq
         cur_body = _wrap_180(
             cur_yaw - (vehicle_yaw if frame == "earth" else 0.0)
         )
         path = yaw_path(cur_body, body)
-        first = _body_to_cmd(path[0], vehicle_yaw, frame)
-        with self._sdk_send_lock:
-            self.sdk.setGimbalSpeed(
-                pitch, 0.0, first, input_mode_t.INPUT_ANGLE
-            )
-        if len(path) > 1:
-            threading.Thread(
-                target=self._finish_yaw_via_nose,
-                args=(seq, pitch, body),
-                daemon=True,
-            ).start()
+        self._start_rate_move(seq, pitch, path)
         note = (
             f", clamped to {body:+.0f} of nose" if clamped else ""
         ) + (", via nose" if len(path) > 1 else "")
         return True, f"heading {heading:.0f} -> yaw {yaw:.1f} ({frame}{note})"
 
-    def _finish_yaw_via_nose(
-        self, seq: int, pitch: float, tgt_body: float
+    def _start_rate_move(
+        self, seq: int, tgt_pitch: float, body_path: List[float]
     ) -> None:
-        """Second leg of a compass click that had to go round the front."""
-        # ponytail: poll reported yaw; 6 s covers 170 deg at slow gimbal rates.
-        deadline = time.monotonic() + 6.0
-        while time.monotonic() < deadline:
-            time.sleep(0.1)
-            with self._state_lock:
-                if seq != self._yaw_seq:
-                    return  # newer click took over
-                gy = self._gimbal_yaw_deg
-                vy = self._vehicle_yaw_deg
-                frame = self._gimbal_frame
-            if gy is None or vy is None:
-                continue
-            cur_body = _wrap_180(gy - (vy if frame == "earth" else 0.0))
-            if abs(cur_body) < 15.0:
-                break
-        else:
-            self._log("yaw via nose: timed out waiting at nose, sending anyway")
-        with self._state_lock:
-            if seq != self._yaw_seq:
-                return
-            vy = self._vehicle_yaw_deg
-            frame = self._gimbal_frame
-        cmd = _body_to_cmd(tgt_body, vy or 0.0, frame)
+        self._mover = threading.Thread(
+            target=self._rate_move, args=(seq, tgt_pitch, body_path), daemon=True
+        )
+        self._mover.start()
+
+    def _send_rate(self, pitch_dps: float, yaw_dps: float) -> None:
         with self._sdk_send_lock:
-            self.sdk.setGimbalSpeed(pitch, 0.0, cmd, input_mode_t.INPUT_ANGLE)
-        self._log(f"yaw via nose: final body {tgt_body:+.0f} -> cmd {cmd:.1f}")
+            self.sdk.setGimbalSpeed(
+                PITCH_RATE_SIGN * pitch_dps, 0.0, YAW_RATE_SIGN * yaw_dps,
+                input_mode_t.INPUT_SPEED,
+            )
+
+    def _rate_move(
+        self, seq: int, tgt_pitch: float, body_path: List[float]
+    ) -> None:
+        """Drive pitch and body yaw to each waypoint with rate commands,
+        then stop. A newer command (seq) aborts this one."""
+        deadline = time.monotonic() + RATE_TIMEOUT_S
+        for tgt_body in body_path:
+            while True:
+                with self._state_lock:
+                    if seq != self._yaw_seq:
+                        return  # newer command took over, it sends its own stop
+                    gp = self._gimbal_pitch_deg
+                    gy = self._gimbal_yaw_deg
+                    vy = self._vehicle_yaw_deg
+                    frame = self._gimbal_frame
+                if time.monotonic() > deadline:
+                    self._send_rate(0.0, 0.0)
+                    self._log(f"rate move: timed out short of body {tgt_body:+.0f}")
+                    return
+                if gp is None or gy is None:
+                    time.sleep(0.05)
+                    continue
+                cur_body = _wrap_180(
+                    gy - (vy if frame == "earth" and vy is not None else 0.0)
+                )
+                ep = tgt_pitch - gp
+                ey = _wrap_180(tgt_body - cur_body)
+                if abs(ep) < RATE_DONE_DEG and abs(ey) < RATE_DONE_DEG:
+                    break
+                self._send_rate(rate_step(ep), rate_step(ey))
+                time.sleep(0.05)
+        self._send_rate(0.0, 0.0)
 
     @staticmethod
     def _log(message: str) -> None:
-        print(
-            f"[REMOTE_EXECUTOR] {message}"
-        )
+        # flush: stdout is a pipe under systemd, else lines sit in the buffer
+        print(f"[REMOTE_EXECUTOR] {message}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -2762,12 +2911,6 @@ def parse_args() -> argparse.Namespace:
         default=32.0,
         help="Native (1x) IR horizontal FOV; used to remap IR clicks.",
     )
-    parser.add_argument(
-        "--ir-vfov-deg",
-        type=float,
-        default=26.0,
-        help="Native (1x) IR vertical FOV; used to remap IR clicks.",
-    )
 
     parser.add_argument(
         "--camera-roll-offset-deg",
@@ -2837,7 +2980,6 @@ def main() -> int:
             args.fallback_vfov_deg
         ),
         ir_hfov_deg=args.ir_hfov_deg,
-        ir_vfov_deg=args.ir_vfov_deg,
         camera_roll_offset_deg=(
             args.camera_roll_offset_deg
         ),

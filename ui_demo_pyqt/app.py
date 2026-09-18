@@ -62,6 +62,28 @@ except ImportError:  # ponytail: optional dep, UI still runs without it
     _MGRS = None
 
 
+def parse_coordinate(text: str) -> Tuple[float, float]:
+    """'lat, lon' (decimal degrees) or an MGRS string -> (lat, lon).
+    Raises ValueError with a short reason."""
+    parts = [t for t in text.replace(",", " ").split() if t]
+    if len(parts) == 2:
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+        except ValueError:
+            pass
+        else:
+            if abs(lat) > 90 or abs(lon) > 180:
+                raise ValueError("lat/lon out of range")
+            return lat, lon
+    if _MGRS is None:
+        raise ValueError("MGRS n/a (pip install mgrs)")
+    try:
+        lat, lon = _MGRS.toLatLon("".join(parts).upper())
+    except Exception:
+        raise ValueError("not 'lat, lon' or MGRS") from None
+    return float(lat), float(lon)
+
+
 def to_mgrs(lat: float, lon: float) -> str:
     """Lat/lon (deg) -> MGRS string at 1 m precision, or a short reason."""
     if _MGRS is None:
@@ -87,6 +109,8 @@ CMD_PAYLOAD_GIMBAL_MODE = "PAYLOAD_GIMBAL_MODE"
 CMD_PAYLOAD_GIMBAL_LEVEL_ROLL = "PAYLOAD_GIMBAL_LEVEL_ROLL"
 CMD_PAYLOAD_GIMBAL_YAW_HEADING = "PAYLOAD_GIMBAL_YAW_HEADING"
 CMD_PAYLOAD_GIMBAL_HEADING_HOLD = "PAYLOAD_GIMBAL_HEADING_HOLD"
+CMD_PAYLOAD_GIMBAL_POINT_AT = "PAYLOAD_GIMBAL_POINT_AT"
+CMD_PAYLOAD_GIMBAL_TARGET_TRACK = "PAYLOAD_GIMBAL_TARGET_TRACK"
 
 GIMBAL_MODE_RESET = 4
 
@@ -597,6 +621,31 @@ class MainWindow(QtWidgets.QMainWindow):
             7, 4,
             QtCore.Qt.AlignmentFlag.AlignHCenter,
         )
+
+        self.target_coord_edit = QtWidgets.QLineEdit()
+        self.target_coord_edit.setPlaceholderText(
+            "lat, lon  or  MGRS (15SUD1234567890)"
+        )
+        self.target_coord_edit.returnPressed.connect(self._on_point_at_coord)
+        self.target_go_button = QtWidgets.QPushButton("Point at")
+        self.target_go_button.setToolTip(
+            "Yaw and pitch the gimbal at this ground coordinate\n"
+            "(assumed at home altitude)."
+        )
+        self.target_go_button.clicked.connect(self._on_point_at_coord)
+        self.track_target_checkbox = QtWidgets.QCheckBox("Track target")
+        self.track_target_checkbox.setToolTip(
+            "Keep the gimbal pointed at the coordinate as the aircraft moves.\n"
+            "Clicking the compass or Reset Gimbal turns it off."
+        )
+        self.track_target_checkbox.toggled.connect(
+            lambda on: self._send_remote_command(
+                CMD_PAYLOAD_GIMBAL_TARGET_TRACK, [1 if on else 0]
+            )
+        )
+        geo_grid.addWidget(self.target_coord_edit, 6, 0, 1, 2)
+        geo_grid.addWidget(self.target_go_button, 6, 2)
+        geo_grid.addWidget(self.track_target_checkbox, 6, 3)
         geo_grid.setColumnStretch(3, 1)
 
         # --------------------------------------------------------------
@@ -947,6 +996,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_button.setChecked(recording)
         self.record_button.setText("Stop Rec" if recording else "Record")
 
+    def _on_point_at_coord(self) -> None:
+        try:
+            lat, lon = parse_coordinate(self.target_coord_edit.text())
+        except ValueError as exc:
+            self.status_label.setText(f"Bad coordinate: {exc}")
+            return
+        self._send_remote_command(CMD_PAYLOAD_GIMBAL_POINT_AT, [lat, lon])
+
     def _send_remote_command(
         self,
         command: str,
@@ -1111,12 +1168,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if recording is not None and bool(recording) != self.record_button.isChecked():
             self._set_record_ui(bool(recording))
 
-        # Mirror executor hold state (Reset Gimbal clears it there).
+        # Mirror executor hold state (Reset Gimbal clears it there). One
+        # hold loop: it holds a heading unless a coordinate target is set.
         hold = data.get("heading_hold_on")
-        if hold is not None and bool(hold) != self.hold_heading_checkbox.isChecked():
-            self.hold_heading_checkbox.blockSignals(True)
-            self.hold_heading_checkbox.setChecked(bool(hold))
-            self.hold_heading_checkbox.blockSignals(False)
+        if hold is not None:
+            has_target = data.get("hold_target") is not None
+            for box, want in (
+                (self.hold_heading_checkbox, bool(hold) and not has_target),
+                (self.track_target_checkbox, bool(hold) and has_target),
+            ):
+                if want != box.isChecked():
+                    box.blockSignals(True)
+                    box.setChecked(want)
+                    box.blockSignals(False)
 
         ap_connected = bool(
             data.get(
@@ -1797,7 +1861,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ok, detail = self._send_remote_command(
             CMD_PAYLOAD_TOUCH,
             [x_payload, y_payload]
-            + (["ir"] if self.ir_stream else []),
+            + (["ir", frame_w / frame_h] if self.ir_stream else []),
         )
 
         if not ok:
