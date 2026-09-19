@@ -114,6 +114,10 @@ CMD_PAYLOAD_GIMBAL_TARGET_TRACK = "PAYLOAD_GIMBAL_TARGET_TRACK"
 
 GIMBAL_MODE_RESET = 4
 
+# payload_camera_view_src values (C_SOURCE)
+VIEW_SRC_EO = 1
+VIEW_SRC_IR = 2
+
 # (label, payload param value)
 # ponytail: Lynx (Guide sensor) names; FLIR-sensor payloads map the same ids
 # to different palettes (see payload_camera_ir_palette in libs/*_define.py).
@@ -777,6 +781,25 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
 
+        # Day/night: the camera's tracker and the /eo stream both follow the
+        # view source, so Night makes tracking work on the IR picture.
+        self._day_view_src = VIEW_SRC_EO
+        self.night_button = QtWidgets.QPushButton("Night (IR)")
+        self.night_button.setCheckable(True)
+        self.night_button.setToolTip(
+            "Switch the camera's view source to IR so tracking works in the "
+            "dark. The EO stream shows IR while this is on."
+        )
+        self.night_button.setStyleSheet(
+            "QPushButton:checked { background: #7c3aed; color: white; }"
+        )
+        self.night_button.clicked.connect(
+            lambda on: self._send_remote_command(
+                CMD_PAYLOAD_CAMERA_PARAM,
+                ["view_src", VIEW_SRC_IR if on else self._day_view_src],
+            )
+        )
+
         self.record_button = QtWidgets.QPushButton("Record")
         self.record_button.setCheckable(True)
         self.record_button.setToolTip(
@@ -828,6 +851,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_row.addSpacing(24)
         controls_row.addWidget(QtWidgets.QLabel("IR Palette"))
         controls_row.addWidget(self.palette_combo)
+        controls_row.addWidget(self.night_button)
         controls_row.addSpacing(24)
         controls_row.addWidget(self.record_button)
         controls_row.addSpacing(24)
@@ -1164,6 +1188,14 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = self.palette_combo.findData(palette)
             if idx >= 0:
                 self.palette_combo.setCurrentIndex(idx)
+
+        # Mirror the view source, remembering the daytime one (EO, or EO with
+        # IR inset) so unticking Night restores whatever it was.
+        view_src = data.get("view_src")
+        if view_src is not None:
+            if view_src != VIEW_SRC_IR:
+                self._day_view_src = view_src
+            self.night_button.setChecked(view_src == VIEW_SRC_IR)
 
         # Mirror camera-reported recording state (clicked() only fires on
         # user clicks, so setChecked here never echoes a command).

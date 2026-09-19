@@ -75,6 +75,7 @@ try:
         PAYLOAD_CAMERA_IR_PALETTE,
         PAYLOAD_CAMERA_IR_ZOOM_FACTOR,
         PAYLOAD_CAMERA_RECORD_SRC,
+        PAYLOAD_CAMERA_VIEW_SRC,
         camera_zoom_value,
         payload_camera_record_src,
     )
@@ -123,10 +124,16 @@ CMD_PAYLOAD_GIMBAL_TARGET_TRACK = "PAYLOAD_GIMBAL_TARGET_TRACK"
 # params: [name, int value]; allowlist of settable camera params
 CAMERA_PARAMS = {
     "ir_palette": PAYLOAD_CAMERA_IR_PALETTE,
+    # Day/night: 1 = EO, 2 = IR. The firmware tracker and the /payload stream
+    # (relayed as /eo) both follow this; /payload_ir is always IR.
+    "view_src": PAYLOAD_CAMERA_VIEW_SRC,
 }
+VIEW_SRC_IR = 2
+IR_ASPECT = 640 / 512  # Boson native frame, streamed uncropped
 
 GREMSY_FRAME_W = 1920
 GREMSY_FRAME_H = 1080
+EO_EDGE_MARGIN_PX = 8  # payload ignores clicks on the frame border
 DEFAULT_TRACK_BOX = 128
 
 DEFAULT_ARDUPILOT_ENDPOINT = os.environ.get(
@@ -135,6 +142,14 @@ DEFAULT_ARDUPILOT_ENDPOINT = os.environ.get(
 )
 
 EARTH_RADIUS_M = 6378137.0
+
+# Status snapshot for local readers (uas_streaming/ir_overlay.py). The command
+# bridge serves one client, so the overlay reads this file instead.
+STATUS_FILE = os.environ.get(
+    "GREMSY_STATUS_FILE",
+    "/dev/shm/gremsy_status.json",
+)
+STATUS_FILE_PERIOD_S = 0.2
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -166,6 +181,18 @@ def ir_px_to_eo_px(
     inside = (
         0 <= x_eo < GREMSY_FRAME_W and 0 <= y_eo < GREMSY_FRAME_H
     )
+    # Outside the EO frame: shrink the offset along its own direction until
+    # it fits, so the gimbal goes as far toward the click as EO allows. The
+    # payload ignores clicks on the border itself (x=0, y=0, y=1079 gave zero
+    # motion, y=1073 moved; 2026-09-18), hence the margin.
+    cx, cy = GREMSY_FRAME_W / 2.0, GREMSY_FRAME_H / 2.0
+    dx, dy = x_eo - cx, y_eo - cy
+    fit = min(
+        1.0,
+        (cx - EO_EDGE_MARGIN_PX) / abs(dx) if dx else 1.0,
+        (cy - EO_EDGE_MARGIN_PX) / abs(dy) if dy else 1.0,
+    )
+    x_eo, y_eo = cx + dx * fit, cy + dy * fit
     return (
         int(round(_clamp(x_eo, 0, GREMSY_FRAME_W - 1))),
         int(round(_clamp(y_eo, 0, GREMSY_FRAME_H - 1))),
@@ -178,10 +205,9 @@ def ir_fov_deg(
 ) -> Tuple[float, float]:
     """(hfov, vfov) of the IR video at zoom_level (0 = 1x, n = (n+1)x).
 
-    vfov is derived from hfov and the streamed frame's aspect (w/h), not
-    from the sensor: the payload delivers the 5:4 Boson image as a 16:9
-    stream by cropping, so the frame spans the full 32 deg wide but only
-    ~18 deg tall. Assumes square pixels (no anisotropic stretch).
+    vfov is derived from hfov and the streamed frame's aspect (w/h); the
+    payload streams the Boson's native 640x512 (5:4) frame uncropped
+    (ffprobe, 2026-09-18). Assumes square pixels (no anisotropic stretch).
     """
     tan_h = math.tan(math.radians(hfov_1x_deg) / 2.0) / (zoom_level + 1)
     return (
@@ -423,6 +449,8 @@ class RemoteExecutor:
         self.ir_palette: Optional[int] = None
         # Last IR zoom level (C_T_ZOOM index 0..7 = 1x..8x, None until known).
         self.ir_zoom: Optional[int] = None
+        # Last view source (C_SOURCE) reported by the camera.
+        self.view_src: Optional[int] = None
 
         # Camera-reported video_status from CAMERA_CAPTURE_STATUS.
         self.recording = False
@@ -633,6 +661,7 @@ class RemoteExecutor:
         self._configure_payload_telemetry()
         self._start_payload_poll_worker()
         self._start_ardupilot_worker()
+        self._start_status_file_worker()
 
         self.bridge.start()
 
@@ -770,6 +799,9 @@ class RemoteExecutor:
             )
             self.sdk.getPayloadCameraSettingByID(
                 PAYLOAD_CAMERA_IR_ZOOM_FACTOR
+            )
+            self.sdk.getPayloadCameraSettingByID(
+                PAYLOAD_CAMERA_VIEW_SRC
             )
 
         requested_params = [
@@ -1025,6 +1057,18 @@ class RemoteExecutor:
 
             if (
                 int(event)
+                == int(
+                    payload_status_event_t.PAYLOAD_CAM_PARAMS
+                )
+                and str(param_mode).rstrip("\x00")
+                == PAYLOAD_CAMERA_VIEW_SRC
+                and len(params) >= 2
+            ):
+                self.view_src = int(params[1])
+                return
+
+            if (
+                int(event)
                 != int(
                     payload_status_event_t.PAYLOAD_GB_ATTITUDE
                 )
@@ -1122,6 +1166,74 @@ class RemoteExecutor:
             name="ardupilot-telemetry",
         )
         self._ap_thread.start()
+
+    def _start_status_file_worker(
+        self,
+    ) -> None:
+        threading.Thread(
+            target=self._status_file_loop,
+            daemon=True,
+            name="status-file",
+        ).start()
+
+    def _status_file_loop(self) -> None:
+        tmp = STATUS_FILE + ".tmp"
+        warned = False
+
+        while self.running:
+            try:
+                status = self._estimate_target_location()
+
+                # The estimator returns before resolving the camera attitude
+                # when GPS or height is missing (bench, indoors); the north
+                # arrow only needs attitudes, so resolve it here.
+                if status.get("camera_yaw_ned_deg") is None:
+                    attitude = [
+                        status.get(key)
+                        for key in (
+                            "vehicle_roll_deg",
+                            "vehicle_pitch_deg",
+                            "vehicle_yaw_deg",
+                            "gimbal_roll_deg",
+                            "gimbal_pitch_deg",
+                            "gimbal_yaw_deg",
+                        )
+                    ]
+                    fresh = (
+                        status.get("attitude_age_s") is not None
+                        and status["attitude_age_s"]
+                        <= self.attitude_stale_timeout
+                        and status.get("gimbal_age_s") is not None
+                        and status["gimbal_age_s"]
+                        <= self.gimbal_stale_timeout
+                    )
+                    if fresh and None not in attitude:
+                        (
+                            _roll,
+                            pitch,
+                            yaw,
+                            _note,
+                        ) = self._resolve_camera_attitude_ned(
+                            *[float(v) for v in attitude],
+                            int(status.get("gimbal_flags") or 0),
+                            str(status.get("gimbal_frame")),
+                        )
+                        status["camera_pitch_ned_deg"] = pitch
+                        status["camera_yaw_ned_deg"] = yaw
+
+                with open(tmp, "w") as handle:
+                    json.dump(status, handle)
+                # Atomic swap: readers never see a half-written file.
+                os.replace(tmp, STATUS_FILE)
+                warned = False
+            except Exception as exc:
+                if not warned:
+                    self._log(
+                        f"status file write failed: {exc}"
+                    )
+                    warned = True
+
+            time.sleep(STATUS_FILE_PERIOD_S)
 
     def _ardupilot_loop(self) -> None:
         while self.running:
@@ -1890,6 +2002,7 @@ class RemoteExecutor:
 
         result = {
             "ir_palette": self.ir_palette,
+            "view_src": self.view_src,
             "recording": self.recording,
             "hold_mode": self._hold_mode,
             "heading_hold_deg": self._hold_heading_deg,
@@ -2385,19 +2498,43 @@ class RemoteExecutor:
                 # Click came from the IR image: convert to the EO pixel
                 # looking the same way, since EagleEyes works in EO frame.
                 hint = ""
-                if len(params) > 2 and params[2] == "ir":
-                    with self._state_lock:
-                        eo_h = self._hfov_deg or self.fallback_hfov_deg
-                        eo_v = self._vfov_deg or self.fallback_vfov_deg
+                from_ir = len(params) > 2 and params[2] == "ir"
+                night = self.view_src == VIEW_SRC_IR
+                gain_fov = None
+                if from_ir or night:
                     # params[3]: w/h of the IR frame the click came from.
                     aspect = (
                         float(params[3])
                         if len(params) > 3 and float(params[3]) > 0
-                        else GREMSY_FRAME_W / GREMSY_FRAME_H
+                        else IR_ASPECT
                     )
                     ir_h, ir_v = ir_fov_deg(
                         self.ir_hfov_deg, self.ir_zoom or 0, aspect
                     )
+                if night:
+                    # View source IR: the payload's 16:9 frame holds the IR
+                    # picture at full height with black bars left and right
+                    # (seen 2026-09-18), so the frame spans the IR VFOV and a
+                    # 16:9-wider HFOV. Remapping into that squeezes x by
+                    # ir_aspect / (16/9) and leaves y alone.
+                    eo_v = ir_v
+                    eo_h = 2.0 * math.degrees(math.atan(
+                        math.tan(math.radians(ir_v) / 2.0)
+                        * GREMSY_FRAME_W / GREMSY_FRAME_H
+                    ))
+                    gain_fov = (eo_h, eo_v)
+                elif from_ir:
+                    with self._state_lock:
+                        eo_h = self._hfov_deg or self.fallback_hfov_deg
+                    # The camera's reported VFOV (e.g. 60.4x32.0) is not a
+                    # 16:9 frame's and its click-to-point ignores it: pitch
+                    # moves 1.13x what it predicts, yaw 1.00x (2026-09-18).
+                    # Derive VFOV from HFOV like the firmware evidently does.
+                    eo_v = 2.0 * math.degrees(math.atan(
+                        math.tan(math.radians(eo_h) / 2.0)
+                        * GREMSY_FRAME_H / GREMSY_FRAME_W
+                    ))
+                if from_ir:
                     x_ir, y_ir = x, y
                     x, y, inside = ir_px_to_eo_px(
                         x, y, ir_h, ir_v, eo_h, eo_v
@@ -2426,6 +2563,8 @@ class RemoteExecutor:
                         y,
                     ),
                 )
+
+                self._log_click_gain(x, y, fov=gain_fov)
 
                 # Remember the click in both modes so the geolocation
                 # estimator has a pixel to work from.
@@ -2531,6 +2670,8 @@ class RemoteExecutor:
 
                 if name == "ir_palette":
                     self.ir_palette = value
+                if name == "view_src":
+                    self.view_src = value
 
                 return True, f"{name}={value}"
 
@@ -2662,6 +2803,54 @@ class RemoteExecutor:
                 f"execution error: {exc}",
             )
 
+    def _log_click_gain(
+        self,
+        x: int,
+        y: int,
+        settle_s: float = 3.0,
+        fov: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        """Diagnostic: how far the payload's click-to-point really moved the
+        gimbal vs. the angle the clicked pixel subtends at the reported FOV.
+        moved/expected ~1.0 is correct; a constant ratio is a firmware
+        pixel->angle scale error. Only valid on a static vehicle."""
+        with self._state_lock:
+            yaw0, pitch0 = self._gimbal_yaw_deg, self._gimbal_pitch_deg
+            hfov = self._hfov_deg or self.fallback_hfov_deg
+            vfov = self._vfov_deg or self.fallback_vfov_deg
+            fov_live = self._hfov_deg is not None
+        if fov is not None:  # night mode: frame FOV comes from the IR lens
+            hfov, vfov = fov
+            fov_live = True
+        if yaw0 is None or pitch0 is None:
+            return
+
+        def angle(px: float, size: int, fov: float) -> float:
+            u = px / size - 0.5
+            return math.degrees(
+                math.atan(2.0 * u * math.tan(math.radians(fov) / 2.0))
+            )
+
+        want_yaw = angle(x, GREMSY_FRAME_W, hfov)
+        want_pitch = -angle(y, GREMSY_FRAME_H, vfov)
+
+        def report() -> None:
+            with self._state_lock:
+                yaw1, pitch1 = self._gimbal_yaw_deg, self._gimbal_pitch_deg
+            if yaw1 is None or pitch1 is None:
+                return
+            d_yaw = (yaw1 - yaw0 + 180.0) % 360.0 - 180.0
+            self._log(
+                f"click gain px=({x},{y}) fov={hfov:.1f}x{vfov:.1f}"
+                f"{'' if fov_live else '(fallback)'} "
+                f"yaw moved={d_yaw:+.2f} expected={want_yaw:+.2f} "
+                f"pitch moved={pitch1 - pitch0:+.2f} expected={want_pitch:+.2f}"
+            )
+
+        timer = threading.Timer(settle_s, report)
+        timer.daemon = True
+        timer.start()
+
     def _take_gimbal(self, owner: str, keep_hold: Optional[str] = None) -> None:
         """Latest intent wins: every gimbal-driving command calls this first.
 
@@ -2689,6 +2878,16 @@ class RemoteExecutor:
             # Always stop: a stale mover exits without one, and the command
             # that called us may fail before it starts a new move.
             self.sdk.setGimbalSpeed(0.0, 0.0, 0.0, input_mode_t.INPUT_SPEED)
+            if owner == "tracker":
+                # The holds leave the payload in follow mode (2), where its
+                # click-to-point lands ~90 px right of the click. The payload
+                # persists GB_MODE across restarts, so set lock (1) on every
+                # handover rather than trusting remembered state.
+                self.sdk.setPayloadCameraParam(
+                    PAYLOAD_CAMERA_GIMBAL_MODE,
+                    1,
+                    mavutil.mavlink.MAV_PARAM_TYPE_UINT32,
+                )
             if owner != "tracker":
                 self.sdk.setPayloadObjectTrackingMode(
                     tracking_mode_t.TRACK_STOP
@@ -3072,7 +3271,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ir-hfov-deg",
         type=float,
-        default=32.0,
+        # Measured 2026-09-18, not a datasheet value: one click, scene shift
+        # in /ir_raw (225 px) vs gimbal yaw moved (8.08 deg) -> f=1594 px.
+        # The old 32.0 placeholder made every IR click overshoot ~1.5x.
+        # ponytail: single measurement, +-1.5 deg; redo at EO 1x, level gimbal.
+        default=22.7,
         help="Native (1x) IR horizontal FOV; used to remap IR clicks.",
     )
 

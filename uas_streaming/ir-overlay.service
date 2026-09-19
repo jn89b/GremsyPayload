@@ -1,0 +1,15 @@
+[Unit]
+Description=IR overlay (ir_raw -> telemetry + north arrow -> ir)
+After=network-online.target docker.service
+
+[Service]
+User=cuav7
+WorkingDirectory=/home/cuav7/uas_streaming
+ExecStart=/usr/bin/python3 /home/cuav7/uas_streaming/ir_overlay.py
+Restart=always
+RestartSec=2
+# Below the EO decoder, which is the process that causes drift when starved.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
