@@ -295,6 +295,40 @@ def rate_cmd(err_deg: float, rate_dps: float) -> float:
     return rate_step(err_deg - RATE_LEAD_S * rate_dps)
 
 
+# Night (IR view) tracking: the payload's tracker follows the target in the
+# IR picture but never steers the gimbal (bare-SDK repro, 2026-09-19), so the
+# executor closes that loop. Feedback is the tracker box at ~10 Hz through the
+# video pipeline, far slower than the attitude feed, hence its own low gain.
+# Proven in useful_scripts/night_track_test.py: 240 px centred in ~2.5 s, no
+# overshoot. Hunts around the target: lower the gain. Lags a mover: raise it.
+NIGHT_TRACK_GAIN = 2.0          # deg/s per deg of error
+NIGHT_TRACK_MAX_DPS = 30.0
+NIGHT_TRACK_DEADBAND_DEG = 0.5
+NIGHT_TRACK_STALE_S = 0.5       # no tracker data this long -> stop the gimbal
+
+
+def night_track_rates(
+    box_x: float, box_y: float, box_w: float, box_h: float, f_px: float
+) -> Tuple[float, float]:
+    """(pitch_dps, yaw_dps) that carry the tracker box to the frame centre.
+    box_x/y is the box's top-left corner in the 1920x1080 frame (what
+    TRK_POS reports); f_px is the frame's focal length in those pixels."""
+
+    def rate(err_px: float) -> float:
+        err_deg = math.degrees(math.atan(err_px / f_px))
+        if abs(err_deg) < NIGHT_TRACK_DEADBAND_DEG:
+            return 0.0
+        mag = min(
+            NIGHT_TRACK_MAX_DPS,
+            max(RATE_MIN_DPS, NIGHT_TRACK_GAIN * abs(err_deg)),
+        )
+        return math.copysign(mag, err_deg)
+
+    ex = box_x + box_w / 2.0 - GREMSY_FRAME_W / 2.0
+    ey = box_y + box_h / 2.0 - GREMSY_FRAME_H / 2.0
+    return rate(-ey), rate(ex)  # image y grows downward, pitch upward
+
+
 def yaw_path(cur_body_deg: float, tgt_body_deg: float) -> List[float]:
     """Body-yaw waypoints from cur to tgt that never cross the rear stop.
 
@@ -823,7 +857,7 @@ class RemoteExecutor:
                 for param_index in requested_params:
                     self.sdk.setParamRate(
                         param_index,
-                        200,
+                        100,  # ms; the night-track loop steers on these
                     )
 
                 # Request the gimbal-device attitude at 20 Hz.
@@ -942,9 +976,12 @@ class RemoteExecutor:
                     elif index == int(
                         payload_param_t.PARAM_TRACK_STATUS
                     ):
+                        # Low byte is tracking_status_t; the payload sets
+                        # higher bits too (257/258 seen 2026-09-19), which
+                        # made every "== 2" LOST check miss.
                         self._track_status = int(
                             round(value)
-                        )
+                        ) & 0xFF
                         self._last_track_param_mono = now
 
                     elif index == int(
@@ -2587,6 +2624,18 @@ class RemoteExecutor:
                             self.track_box,
                         )
 
+                    if night:
+                        with self._state_lock:
+                            seq = self._yaw_seq
+                            # Forget the last target's box so the loop waits
+                            # for this acquisition's first report.
+                            self._last_track_param_mono = 0.0
+                        threading.Thread(
+                            target=self._night_track_loop,
+                            args=(seq,),
+                            daemon=True,
+                        ).start()
+
                     return (
                         True,
                         f"tracking acquisition sent "
@@ -2837,6 +2886,7 @@ class RemoteExecutor:
         def report() -> None:
             with self._state_lock:
                 yaw1, pitch1 = self._gimbal_yaw_deg, self._gimbal_pitch_deg
+                track_status = self._track_status
             if yaw1 is None or pitch1 is None:
                 return
             d_yaw = (yaw1 - yaw0 + 180.0) % 360.0 - 180.0
@@ -2844,7 +2894,10 @@ class RemoteExecutor:
                 f"click gain px=({x},{y}) fov={hfov:.1f}x{vfov:.1f}"
                 f"{'' if fov_live else '(fallback)'} "
                 f"yaw moved={d_yaw:+.2f} expected={want_yaw:+.2f} "
-                f"pitch moved={pitch1 - pitch0:+.2f} expected={want_pitch:+.2f}"
+                f"pitch moved={pitch1 - pitch0:+.2f} expected={want_pitch:+.2f} "
+                f"from yaw={yaw0:+.1f} pitch={pitch0:+.1f} "
+                f"view_src={self.view_src} track={self.track_on_click} "
+                f"track_status={track_status}"
             )
 
         timer = threading.Timer(settle_s, report)
@@ -2992,6 +3045,35 @@ class RemoteExecutor:
             f", clamped to {body:+.0f} of nose" if clamped else ""
         ) + (", via nose" if len(path) > 1 else "")
         return True, f"heading {heading:.0f} -> yaw {yaw:.1f} ({frame}{note})"
+
+    def _night_track_loop(self, seq: int) -> None:
+        """Steer the gimbal onto the payload tracker's box while the view
+        source is IR. Ends when anything else takes the gimbal (seq), Track
+        is unticked, or the view source leaves IR."""
+        self._log("night track: executor steering from the tracker box")
+        while True:
+            with self._state_lock:
+                status = self._track_status
+                box = (self._track_x, self._track_y, self._track_w, self._track_h)
+                age = time.monotonic() - self._last_track_param_mono
+            if not self.track_on_click or self.view_src != VIEW_SRC_IR:
+                self._send_rate(seq, 0.0, 0.0)
+                break
+            pitch_dps = yaw_dps = 0.0
+            if status == 1 and None not in box[:2] and age < NIGHT_TRACK_STALE_S:
+                _, ir_v = ir_fov_deg(
+                    self.ir_hfov_deg, self.ir_zoom or 0, IR_ASPECT
+                )
+                f_px = (GREMSY_FRAME_H / 2.0) / math.tan(math.radians(ir_v) / 2.0)
+                pitch_dps, yaw_dps = night_track_rates(
+                    box[0], box[1],
+                    box[2] or self.track_box, box[3] or self.track_box,
+                    f_px,
+                )
+            if not self._send_rate(seq, pitch_dps, yaw_dps):
+                break  # newer command took over and already sent the stop
+            time.sleep(0.1)
+        self._log("night track: steering ended")
 
     def _start_rate_move(
         self,
